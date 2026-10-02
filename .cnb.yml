@@ -1,0 +1,158 @@
+# 每日自检：同步官技能文件完整性 + bootstrap 可用性（见 .ci/watchdog.yml）
+include:
+  - .ci/watchdog.yml
+
+# NPC 触发事件流水线（自建镜像 + CodeBuddy 式多模型动态绑定）
+#
+# 依据 docs.cnb.cool/zh/build/npc.md「按角色名配置」与 /zh/build/internal-steps.md#npc：
+#   - 顶层 key = settings.yml 角色名（须完全一致）：被 @ 该角色时加载其下事件流水线。
+#   - 镜像：自建 Dockerfile（预装 cnb cli/git/gpg/gh）→ push 构建推送制品库，供 NPC 事件引用
+#     ${CNB_DOCKER_REGISTRY}/${CNB_NPC_SLUG_LOWERCASE}:latest。
+#   - 模型动态绑定：角色名 = 模型 ID，npc:go options.model = ${CNB_NPC_NAME}
+#     （CNB_NPC_NAME 展开为被触发的角色名 = 该模型 ID），即可 @ 不同模型角色做同任务 A/B。
+#   - 思考级别 / 图片支持按模型动态判定（对齐 npc/CodeBuddy 口径 @ 180dd6b）：
+#     hy4-preview → thinking high；deepseek-v4.1-flash → thinking off；其余 medium。
+#     deepseek-v4.1-flash / glm-5.3-flash → supportImage true。
+#
+# 密钥注入：本公开导出快照已**剥离全部 imports 密钥引用**。
+#   原 CNB 仓在 npc 事件流水线用 imports 注入 CNB_MIRROR_TOKEN / GH_TOKEN（跨根组织推仓凭证）；
+#   此处不再引用任何密钥仓库，故该注入能力在导出件中不存在。
+
+# PR CI：目标分支为 main 的 PR（创建/重开/源分支 push）跑 watchdog 全量自检。
+# 注意：PR 事件的分支 key 匹配的是 PR **目标分支**（quick-start 口径：main: pull_request
+# = 监听目标为 main 的 PR），配置内容读预合并后 commit——此前误写成 "feat/*"（匹配
+# 目标分支为 feat/* 的 PR，不存在），永远不触发，commit 9ef379d 前还叠着一层
+# stages 嵌套列表解析失败，两层 bug 均已修。
+# 跨仓自举克隆本仓技能源用 PR 源分支（CNB_PULL_REQUEST_BRANCH）——skills/ 等
+# 新增文件只在 PR 分支上，克隆 main（默认）在合并前必然取不到技能（鸡生蛋）。
+# 守护项与每日 04:23 自检完全同源（!reference 引用 .skill-selftest 锚点，防两处漂移）。
+main:
+  pull_request:
+    - name: pr-watchdog-selftest
+      runner:
+        cpus: 1
+      docker:
+        image: cnbcool/default-build-env
+      env:
+        SKILLS_REF: ${CNB_PULL_REQUEST_BRANCH}
+      stages: !reference [.skill-selftest, selftest_stages]
+  # 镜像构建流水线：push 到 main 时构建并推送自定义 NPC 镜像到制品库
+  push:
+    - services:
+        - docker
+      stages:
+        - name: Docker build
+          script: docker build -t ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:latest .
+        - name: Docker push
+          script: docker push ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:latest
+
+# ---- 动态模型角色（角色名 = 模型 ID）：npc:go 用 ${CNB_NPC_NAME} 运行时绑定 ----
+# contextWindow 1m：对齐 npc/CodeBuddy 当前口径
+.model_role: &model_role
+  issue.comment@npc:
+      docker:
+        image: ${CNB_DOCKER_REGISTRY}/${CNB_NPC_SLUG_LOWERCASE}:latest
+      stages:
+        - name: set model
+          script: |
+            if [ "$CNB_NPC_NAME" = "hy4-preview" ]; then
+              echo "##[set-output NPC_THINKING=high]"
+            elif [ "$CNB_NPC_NAME" = "deepseek-v4.1-flash" ]; then
+              echo "##[set-output NPC_THINKING=off]"
+            else
+              echo "##[set-output NPC_THINKING=medium]"
+            fi
+            if [ "$CNB_NPC_NAME" = "deepseek-v4.1-flash" ] || [ "$CNB_NPC_NAME" = "glm-5.3-flash" ]; then
+              echo "##[set-output NPC_SUPPORT_IMAGE=true]"
+            else
+              echo "##[set-output NPC_SUPPORT_IMAGE=false]"
+            fi
+          exports:
+            NPC_THINKING: NPC_THINKING
+            NPC_SUPPORT_IMAGE: NPC_SUPPORT_IMAGE
+        - name: run with npc
+          type: npc:go
+          options:
+            model: ${CNB_NPC_NAME}
+            contextWindow: 1m
+            thinkingLevel: $NPC_THINKING
+            supportImage: $NPC_SUPPORT_IMAGE
+  pull_request.comment@npc:
+      docker:
+        image: ${CNB_DOCKER_REGISTRY}/${CNB_NPC_SLUG_LOWERCASE}:latest
+      stages:
+        - name: set model
+          script: |
+            if [ "$CNB_NPC_NAME" = "hy4-preview" ]; then
+              echo "##[set-output NPC_THINKING=high]"
+            elif [ "$CNB_NPC_NAME" = "deepseek-v4.1-flash" ]; then
+              echo "##[set-output NPC_THINKING=off]"
+            else
+              echo "##[set-output NPC_THINKING=medium]"
+            fi
+            if [ "$CNB_NPC_NAME" = "deepseek-v4.1-flash" ] || [ "$CNB_NPC_NAME" = "glm-5.3-flash" ]; then
+              echo "##[set-output NPC_SUPPORT_IMAGE=true]"
+            else
+              echo "##[set-output NPC_SUPPORT_IMAGE=false]"
+            fi
+          exports:
+            NPC_THINKING: NPC_THINKING
+            NPC_SUPPORT_IMAGE: NPC_SUPPORT_IMAGE
+        - name: run with npc
+          type: npc:go
+          options:
+            model: ${CNB_NPC_NAME}
+            contextWindow: 1m
+            thinkingLevel: $NPC_THINKING
+            supportImage: $NPC_SUPPORT_IMAGE
+
+hy4-preview: *model_role
+deepseek-v4.1-flash: *model_role
+glm-5.3: *model_role
+glm-5.3-flash: *model_role
+glm-5.2: *model_role
+kimi-k3: *model_role
+
+# ---- 默认职能角色「对齐管家」：写死默认模型 deepseek-v4.1-flash（最新模型）----
+.x_align_event: &x_align_event
+    docker:
+      image: ${CNB_DOCKER_REGISTRY}/${CNB_NPC_SLUG_LOWERCASE}:latest
+    stages:
+      - name: npc go
+        type: npc:go
+        options:
+          model: deepseek-v4.1-flash
+          contextWindow: 1m
+          thinkingLevel: off
+          supportImage: true
+.x_align_role: &x_align_role
+  issue.comment@npc: *x_align_event
+  pull_request.comment@npc: *x_align_event
+
+对齐管家: *x_align_role
+
+# ---- 同步官：参考上游项目引入职能角色（参考上游项目 i.o/sync，全功能保留）----
+# 与 $/模型角色不同：同步官需要先跨仓自举技能（NPC 事件工作区是目标仓库，
+# 没有本仓的 skills/，bootstrap-skills.sh 会先克隆本仓再装技能），然后 npc:go。
+# npc:go 不指定 model：同步任务与模型无关，走平台默认模型。
+同步官:
+  # 密钥注入（owner 决策 2026-09-23，Issue #13）：直接 imports 现有密钥仓库文件，
+  # 与既有对齐类角色同款。同步官因此不可分享（不进 NPC 榜单）——本仓保持公开，
+  # 外部用户仍可按完整路径 @xgzwlkj/npc(同步官) 触发，服务不受影响。
+  # 注入的 CNB_MIRROR_TOKEN / GH_TOKEN 可作为私有参考项目拉取凭证（CNB / GitHub 参考上游项目）。
+  issue.comment@npc:
+      docker:
+        image: ${CNB_DOCKER_REGISTRY}/${CNB_NPC_SLUG_LOWERCASE}:latest
+      stages:
+        - name: bootstrap-skills
+          script: bash .cnb/bootstrap-skills.sh
+        - name: npc go
+          type: npc:go
+  pull_request.comment@npc:
+      docker:
+        image: ${CNB_DOCKER_REGISTRY}/${CNB_NPC_SLUG_LOWERCASE}:latest
+      stages:
+        - name: bootstrap-skills
+          script: bash .cnb/bootstrap-skills.sh
+        - name: npc go
+          type: npc:go

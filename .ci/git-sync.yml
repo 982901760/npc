@@ -1,0 +1,454 @@
+# 参考上游项目流水线模板（自动合并版）
+#
+# 用法：同步官会把本文件复制到目标仓库的 .cnb/git-sync.yml，并在该仓库的
+# .cnb.yml 里加一行 include 引入它：
+#
+#   include:
+#     - .cnb/git-sync.yml
+#
+# 私有参考项目（可选）：模板自身零密钥引用，公开参考项目原样可用。同步私有参考项目时，
+# 在本文件的 env 段为 UPSTREAM_TOKEN 注入目标仓库可用的拉取令牌
+# （来源不限——如经密钥仓库 imports 注入的环境变量；引用方自行决定写法），
+# 脚本侧零改动：有令牌走令牌、无令牌回落匿名。令牌只在拉取时临时使用，
+# 不落代码、不进日志。
+#
+# 目标仓库一共只落地两个文件：本文件 + .cnb/sync-upstream.sh。
+#
+# 无人值守：定时任务先跑同步，**只有真的产生变更**时才推一个临时分支、开 PR，
+# 然后**在同一轮流水线里直接把 PR 合掉**，全程不需要任何人工动作，
+# 也不需要预先去仓库设置里配保护分支。
+# 没有变更时整条流水线在第一个阶段就结束，不推送、不开 PR、不触发任何合并。
+#
+# `.cnb/sync-upstream.sh` 由同步官初装时提交进来，之后**一直留在仓库里**
+# （脚本每次同步都会确保工作树里有它），下一次定时任务才拿得到。
+# 同时它是唯一不被参考项目快照覆盖的同步侧文件；`.cnb.yml`、`.cnb/`、`.ci/`
+# 作为平台配置也始终受保护。
+#
+# 「无更新」的判定别改：脚本是**先 `git add -A`，再比索引与 HEAD**。
+# 早先是「先 `git rm --cached .cnb`，再比 `git status --porcelain`」——
+# `.cnb/` 在工作区里始终存在，被摘出索引必然产生差异，于是 no-update
+# 永远不命中，定时任务会每天堆一个空提交和空 PR。
+#
+# 合并是怎么做到的（两条路，都不需要人工）：
+#   主路径 —— 内联直接合并：开完 PR 后，同一轮流水线调 `cnb pulls merge-pull`
+#             直接合掉它。这条路径**不依赖保护分支、不依赖评审人**，
+#             是真正意义上的零前置条件无人值守。
+#   兜底路径 —— 若目标仓库的默认分支**恰好**是保护分支（且开了「需要评审人批准」），
+#             PR 还会触发下面的 `pull_request.mergeable` 流水线，
+#             由 `git:auto-merge` 复核式合并（幂等：已合并的 PR 会被跳过）。
+#
+# 为什么不再要求用户去设保护分支：NPC 的 token 没有 `repo-manage:rw`，
+# 无法替用户创建保护分支规则；而「要用户先去设置里点几下」本身就不是无人值守。
+# 所以合并动作内联进流水线，前置条件归零。
+# 详细步骤与取舍见技能仓库 README 的「无人值守：全自动合并」一章。
+#
+# 占位符（同步官按目标仓库实际情况替换；替换后**不留任何尖括号**）：
+#   <BRANCH>         目标仓库的默认分支名，如 main
+#   <CRON>           cron 表达式。默认每天一次 "17 3 * * *"（03:17，Asia/Shanghai），
+#                    用户特别说明了才改：每天两次写 "17 3,15 * * *"；平台最小调度间隔 5 分钟
+#   <RUNNER_CPUS>    任务 CPU 核数，默认 2（同步任务很轻）；参考上游项目仓库特别大时才抬到 4
+#   <UPSTREAM_REPO>  参考上游项目地址，如 https://github.com/zai-org/ZCode
+#   <UPSTREAM_BRANCH> 参考项目分支，默认 main
+#   <TARGET_DIR>     目标子目录；平铺模式填空字符串 ""
+#   <BOOTSTRAP_BRANCH> 同步官初装时用的引导分支名（如 sync/bootstrap）。
+#                   本分支上的引导 PR 合并后由 pull_request.merged 流水线自动删掉，
+#                   避免「配了无人值守，却有个 PR 一直挂着没人处理」。
+#                   这个占位符出现在注释与一条 pull_request.merged 的 if 里，
+#                   不填不影响定时任务，但会失去「引导 PR 自我了结」。
+#   <SEED_SOURCE>    只用于「空仓库首次上车」：填参考项目地址，首次同步时用浅克隆
+#                    直接把参考项目快照落成首个提交（比真实 merge 快）。仓库已有提交后
+#                    这一项会被自动忽略，留着不写也无妨——所以首次同步完成后**不必**
+#                    再改这一行，也不需要因此再开一个 PR。
+#
+# 空仓库的「默认分支」由本流水线负责初始化（见 init-default-branch 阶段）：
+#   push 到不存在的分支会让它成为远端分支，而**空仓库的第一个远端分支就是
+#   该仓库的默认分支**。同步官初装时推的是引导分支 sync/bootstrap，
+#   于是平台把默认分支定成了 sync/bootstrap，用户还得进设置里改回 main ——
+#   而定时任务挂在 <BRANCH> 上，默认分支不对时整条无人值守链路都落空。
+#   所以这里在首次推送前，若默认分支还不存在，就先把它创建为 <BRANCH>
+#   （一个指向当前 HEAD 的初始提交），默认分支从此就固定是 <BRANCH> 了。
+#
+#   <BRANCH> 填什么：优先取目标仓库自己声明的默认分支（CNB_DEFAULT_BRANCH）；
+#   目标仓库还是空的、自己还没声明默认分支时，**跟随参考上游项目的默认分支** ——
+#   这样「极简 clone 一份参考上游项目再自动跟随」拿到的就是同名的默认分支
+#   （参考项目是 master 就是 master），不会凭空多出一个 main。
+#   定时任务挂在 <BRANCH> 下，所以这个值必须与「init-default-branch 实际
+#   建出来的分支」一致：判断空仓库时用的参考项目地址取自本文件的 SEED_SOURCE，
+#   SEED_SOURCE 为空（已有仓库只增量同步的场景）时回落到 UPSTREAM_REPO。
+
+# 定时任务必须挂在明确的分支名下，不支持 glob。
+# 同步官会把它替换为「目标仓库的默认分支名」：优先仓库自己声明的默认分支，
+# 空仓库 + 参考项目默认分支不是 main（如 master / develop）时跟随参考上游项目。
+#
+# ⚠️ 已知限制（实测，别再写成「等价」）：这条同名的 `pull_request.mergeable`
+# 兜底流水线**只在默认分支恰好是保护分支时**才会被平台触发。目标仓库的默认分支
+# 是 git-sync 跟随参考上游项目建的（参考项目是 master 就是 master），而仓库的保护分支设置
+# 未必跟着走 —— 那种情况下兜底路径是哑的。
+# 但这不是无人值守的缺口：主路径是下面 merge-pr-inline 的**内联合并**，
+# 它不依赖任何平台事件，也跟保护分支无关。
+# 形态是 `${CNB_DEFAULT_BRANCH:-${SYNC_DEFAULT_BRANCH:-main}}` —— 见上面 resolve-default-branch
+# 阶段写入的 .git/sync-default-branch；别保留这个 <BRANCH> 占位符。
+<BRANCH>:
+  # 按 <CRON> 定时检查参考上游项目更新：有更新才落地 + 自动合并，无更新则就地结束。
+  # 频率默认每天一次（03:17 Asia/Shanghai）；用户特别说明才改，例如每天两次写 "17 3,15 * * *"。
+  "crontab: <CRON>":
+    - name: sync-upstream
+      runner:
+        cpus: <RUNNER_CPUS>
+      docker:
+        image: cnbcool/default-build-env
+      # 平台原生 LFS 支持（默认就是 true，这里显式声明以表意）：
+      # 让 runner 在检出时就把 LFS 真身拉下来，减少脚本兜底的负担。
+      git:
+        enable: true
+        lfs: true
+      env:
+        UPSTREAM_REPO: <UPSTREAM_REPO>
+        UPSTREAM_BRANCH: <UPSTREAM_BRANCH>
+        TARGET_DIR: <TARGET_DIR>
+        SEED_SOURCE: <SEED_SOURCE>
+        # 私有参考项目时在此注入 UPSTREAM_TOKEN（同步官会带过来）；公开参考项目删掉这行
+        # UPSTREAM_TOKEN: <由引用方注入，模板不写死>
+        # 临时分支名：带时间戳，避免复用旧分支把历史带歪
+        SYNC_BRANCH: sync/upstream-auto
+        # 同步官初装时用的引导分支名。pull_request.merged 流水线靠它认出
+        # 「引导 PR 已合并」，然后删掉该分支，避免那个 PR 一直挂着没人处理。
+        BOOTSTRAP_BRANCH: <BOOTSTRAP_BRANCH>
+        # 定时任务无人值守：成功路径不刷屏，结果由 report 阶段汇报
+        SYNC_QUIET: "1"
+        # 只提交不推送 —— 推送与开 PR 交给下面的阶段
+        SYNC_NO_PUSH: "1"
+      # 串行化，避免两次同步并发互相覆盖
+      lock:
+        key: sync-upstream
+        wait: true
+        cancel-in-wait: true
+      stages:
+        # 先算一次「空仓库上车时该用哪个默认分支」，结果写进 .git/sync-default-branch，
+        # 供下一个阶段读取。放在这里而不是别处，是因为定时任务挂在 <BRANCH> 下，
+        # 而 <BRANCH> 要的是「init-default-branch 实际会建出来的那个分支名」。
+        #
+        # 判定顺序（踩过的坑，别改回去）：
+        #   1) 远端已有任何分支 → 什么都不用算，沿用已有默认分支（只打一条日志）
+        #   2) 空仓库 + SEED_SOURCE 为空 → 不猜，回落 main
+        #   3) 空仓库 + SEED_SOURCE 非空 → **优先跟随参考项目默认分支**，只有直接扫
+        #      .git/refs/heads/ 确认仓库自己确实有本地分支时，才把 CNB_DEFAULT_BRANCH
+        #      当「用户自己的选择」采信
+        #
+        # 为什么第 3 步不能直接信 CNB_DEFAULT_BRANCH：实测在空仓库 runner 上它
+        # **已经预设成 main** —— 于是「空仓库跟随参考上游项目 master」永远算不出来，
+        # 绕一圈又回到硬编码 main。用户的诉求恰恰是「参考项目是什么分支就跟什么分支」。
+        # 而 SEED_SOURCE 只在「空仓库首次上车」时才有意义：已有提交的仓库里这一项
+        # 本来就会被同步脚本忽略，所以拿它当「这是首次上车」的信号是准确的。
+        - name: resolve-default-branch
+          script: |
+            set -uo pipefail
+            # 注意：本阶段有意**不开 errexit**。`UP_SDB="$(git ls-remote ... | awk ...)"` 里
+            # 的管道一旦失败，errexit 会让脚本**静默退出**（连下面「探测失败回落 main」
+            # 的兜底都打不出来）—— 实测过，日志里什么也没有，看起来像任务凭空消失。
+            # 这里靠下面的 `[ -z "${UP_SDB}" ]` 显式兜底就够了。
+            UPSTREAM_FOR_BRANCH="${SEED_SOURCE:-${UPSTREAM_REPO}}"
+            if [ -n "$(git ls-remote --heads origin 2>/dev/null)" ]; then
+              SDB="${CNB_DEFAULT_BRANCH:-main}"
+              echo "仓库已有远端分支，沿用现有默认分支 ${SDB}（本阶段不初始化）。"
+              printf '%s' "${SDB}" > .git/sync-default-branch
+              exit 0
+            fi
+            if [ -z "${SEED_SOURCE}" ]; then
+              SDB="${CNB_DEFAULT_BRANCH:-main}"
+              echo "空仓库但没有 SEED_SOURCE，默认分支回落 ${SDB}。"
+              printf '%s' "${SDB}" > .git/sync-default-branch
+              exit 0
+            fi
+            # 取值必须靠 awk 的字段切分：`git ls-remote --symref` 的输出是
+            # `ref: refs/heads/master	HEAD`（tab 分隔），用 sed 捕获组会把
+            # 尾部的 tab 一起吞进分支名，push 出去的 ref 就带脏字符了。实测踩过。
+            # awk 之后再做一次清洗：剥掉可能的尾随空白 / CR，并兜掉可能在首位的 `HEAD`。
+            UP_SDB="$(git ls-remote --symref "${UPSTREAM_FOR_BRANCH}" HEAD 2>/dev/null \
+              | awk '/^ref: refs\/heads\// { sub("refs/heads/", "", $2); print $2; exit }' \
+              | tr -d '\r\t' \
+              | tr -d '[:space:]')"
+            [ "${UP_SDB}" = "HEAD" ] && UP_SDB=""
+            if [ -z "${UP_SDB}" ]; then
+              SDB="${CNB_DEFAULT_BRANCH:-main}"
+              echo "⚠️ 参考项目默认分支探测失败（${UPSTREAM_FOR_BRANCH}），默认分支回落 ${SDB}。"
+              printf '%s' "${SDB}" > .git/sync-default-branch
+              exit 0
+            fi
+            LOCAL_BRANCHES="$(ls -1 .git/refs/heads 2>/dev/null || true)"
+            if [ -n "${LOCAL_BRANCHES}" ] && [ -n "${CNB_DEFAULT_BRANCH:-}" ]; then
+              # 本地已有分支 + 仓库声明了默认分支 → 这是用户自己的选择，优先它
+              SDB="${CNB_DEFAULT_BRANCH}"
+              echo "空仓库、但仓库已声明默认分支 ${SDB}（本地已有分支），优先仓库声明。"
+            else
+              # 空仓库首次上车：跟随参考项目默认分支，目标仓库拿到的就是同名默认分支
+              SDB="${UP_SDB}"
+              echo "空仓库首次上车：默认分支跟随参考上游项目 → ${SDB}"
+            fi
+            printf '%s' "${SDB}" > .git/sync-default-branch
+            echo "本次使用默认分支：$(cat .git/sync-default-branch)"
+        # 空仓库专属：先把默认分支建出来，见下方占位符说明。
+        # 为什么必须做：push 一个新分支名会让它在远端出现，而空仓库的
+        # **第一个远端分支就是默认分支**。同步官初装推的是 sync/bootstrap，
+        # 默认分支就被定成了它 —— 用户得进仓库设置手动改回 main，
+        # 而定时任务挂在 <BRANCH> 上，默认分支不对时无人值守整条落空。
+        #
+        # 分支名优先级：仓库自己声明的默认分支 > 参考项目默认分支（resolve-default-branch
+        # 阶段算好，落在 .git/sync-default-branch）> main。这样空仓库上车时，
+        # 参考项目是 master 就跟着建 master，「clone 之后自动跟随」不会被凭空改成 main。
+        - name: init-default-branch
+          script: |
+            set -euo pipefail
+            # 分支名一律读上一个阶段算好的结果，别在这里再算一遍：
+            # 定时任务挂在 <BRANCH> 下，这里必须与它一致，否则任务永远不触发。
+            DESIRED_BRANCH="$(cat .git/sync-default-branch 2>/dev/null || echo)"
+            DESIRED_BRANCH="${DESIRED_BRANCH:-${CNB_DEFAULT_BRANCH:-main}}"
+            DESIRED_BRANCH="${DESIRED_BRANCH:-main}"
+            # 仓库已有任何远端分支（尤其已有默认分支）就什么都不做：
+            # 本阶段只补「空仓库上车」这一种情况，绝不改写已有仓库的分支结构
+            if [ -n "$(git ls-remote --heads origin 2>/dev/null)" ]; then
+              echo "仓库已有远端分支，默认分支保持不变（本次不初始化）。"
+              exit 0
+            fi
+            echo "空仓库：先把默认分支初始化为 ${DESIRED_BRANCH}（否则首次 push 的分支名会成为默认分支）。"
+            git config user.name  "cnb-sync-bot"
+            git config user.email "cnb-sync-bot@users.noreply.cnb.cool"
+            # 平台检出时默认分支还不存在，工作区里可能有未跟踪的配置文件；
+            # 只提交这次初始化需要的东西，别把同步还没落盘的内容带进去。
+            if [ -f .cnb.yml ]; then git add -A -- .cnb.yml; fi
+            if [ -d .cnb ]; then git add -A -- .cnb; fi
+            if git diff --cached --quiet --exit-code 2>/dev/null; then
+              git commit -q --no-gpg-sign --allow-empty -m "chore: 初始化默认分支 ${DESIRED_BRANCH}"
+            else
+              git commit -q --no-gpg-sign -m "chore: 初始化默认分支 ${DESIRED_BRANCH}"
+            fi
+            git push -f origin "HEAD:refs/heads/${DESIRED_BRANCH}"
+            echo "✅ 默认分支已初始化为 ${DESIRED_BRANCH}；首次 push 之后它即成为仓库默认分支。"
+        - name: fetch-and-merge-upstream
+          # 脚本从 UPSTREAM_URL / SYNC_DIR 读入参，模板里的 env 名字是
+          # UPSTREAM_REPO / TARGET_DIR（沿用旧名，便于用户直接读懂）。
+          # 这里做一次显式映射，别让脚本去猜变量名。
+          script: |
+            export UPSTREAM_URL="${UPSTREAM_REPO}"
+            export SYNC_DIR="${TARGET_DIR}"
+            bash .cnb/sync-upstream.sh
+          # 同步任务很轻：2 核够用；默认上限 2 小时，只有超大仓库才需要放宽
+          timeout: 30m
+          exports:
+            SYNC_STATUS: SYNC_STATUS
+            SYNC_LFS: SYNC_LFS
+        - name: open-auto-merge-pr
+          # 只有真正产生变更时才推送 + 开 PR；无更新则整条流水线到此结束
+          if: '[ "$SYNC_STATUS" = "merged" ]'
+          script: |
+            set -euo pipefail
+            BRANCH="${SYNC_BRANCH:-sync/upstream-auto}"
+            # 每次用带时间戳的独立分支，避免复用旧分支导致 PR 内容不清
+            BRANCH="${BRANCH}-$(date -u +%Y%m%d%H%M%S)"
+            git push -f origin "HEAD:refs/heads/${BRANCH}"
+            echo "##[set-output AUTO_MERGE_BRANCH=${BRANCH}]"
+            # 下面是**纯信息性**的只读探测：只解释「兜底路径会不会也生效」，
+            # 不影响主路径（下一阶段的 merge-pull 内联合并）。
+            #
+            # 两个坑都要挡住 —— 它们都会把整轮同步掐掉或误报：
+            #   1. `cnb` 不在 PATH / CLI 报错 / 接口 5xx：管道失败时 `set -e` 会让脚本
+            #      **静默退出**，后面的融合并全都不执行（实测：日志空白、看不出原因）
+            #   2. 字段清洗：`cnb git list-branches` 返回 `name: "main"`（带引号）或
+            #      `name: refs/heads/main` 时，旧写法会一律判成「非保护分支」并误报
+            # 结论：探测失败或拿不准时按「未知」处理，绝不因此中止。
+            PROT="unknown"
+            PROT_RAW="$( { cnb git list-branches --repo "$CNB_REPO_SLUG" --page-size 100 2>/dev/null || true; } \
+              | awk -v b="${CNB_BRANCH}" \
+                  '$1=="-" && $2=="name:" { cur=$3; gsub(/["\r]/,"",cur); sub(/^refs\/heads\//,"",cur); }
+                   cur==b { if ($1=="protected:") { p=$2; gsub(/["\r]/,"",p); print p; exit } }' )"
+            case "${PROT_RAW}" in
+              true)  PROT="true";;
+              false) PROT="false";;
+              *)     PROT="unknown";;
+            esac
+            if [ "${PROT}" = "true" ]; then
+              echo "ℹ️ 默认分支 ${CNB_BRANCH} 是保护分支：除内联合并外，pull_request.mergeable 兜底路径也会生效。"
+            elif [ "${PROT}" = "false" ]; then
+              echo "ℹ️ 默认分支 ${CNB_BRANCH} 不是保护分支：不影响，本轮由内联 merge-pull 直接合并。"
+            else
+              echo "ℹ️ 保护状态探测失败（CLI/网络/响应格式）：不影响，本轮仍由内联 merge-pull 直接合并。"
+            fi
+          exports:
+            AUTO_MERGE_BRANCH: AUTO_MERGE_BRANCH
+        - name: create-auto-merge-pr
+          if: '[ "$SYNC_STATUS" = "merged" ]'
+          script: |
+            set -euo pipefail
+            [ -f .cnb/sync-upstream.sh ] || { echo "!! 缺少 .cnb/sync-upstream.sh"; exit 1; }
+            HEAD_SHA="$(git rev-parse --short HEAD)"
+            TITLE="chore: 跟进参考上游项目 ${UPSTREAM_REPO##*/} @ ${HEAD_SHA}"
+            {
+              echo "参考上游项目：${UPSTREAM_REPO}（分支 ${UPSTREAM_BRANCH:-main}）"
+              echo "同步到的提交：${HEAD_SHA}"
+              echo "目标目录：${TARGET_DIR:-<仓库根目录>}"
+              echo "自动更新：按 crontab 定时检查，有更新才落地并自动合并"
+              echo "自动合并：由创建本 PR 的同一轮流水线直接合并，无需人工、无需预配保护分支"
+              echo "调整：改 .cnb/git-sync.yml 的 env / crontab；停用则从 .cnb.yml 移除 include"
+              echo
+              echo "> 本 PR 由定时同步流水线创建，会在同轮流水线内自动合并，无需人工操作。"
+            } > /tmp/sync-pr-body.md
+            # 只取 PR 编号：`cnb pulls post-pull` 的成功响应里 number 是字符串。
+            # 合并阶段要拿着它去调 merge-pull，因此这里必须把编号传出去。
+            #
+            # 解析要**容忍缩进**（`  number: "42"`）——一旦解析不出来，后面的内联合并
+            # 就不会执行，用户看到的仍是「PR 挂着没人合」。解析不出来时必须把
+            # CLI 的原始输出打出来并显式报错，不能只留一句无信息量的失败。
+            post_out="$(cnb pulls post-pull \
+                         --repo "$CNB_REPO_SLUG" \
+                         --title "$TITLE" \
+                         --head "${AUTO_MERGE_BRANCH}" \
+                         --base "${CNB_BRANCH}" \
+                         --body-file /tmp/sync-pr-body.md 2>&1 || true)"
+            echo "$post_out"
+            PR_NO="$(printf '%s\n' "$post_out" \
+              | awk '{ line=$0; sub(/^[[:space:]]+/,"",line) }
+                     line ~ /^number:[[:space:]]*"?[0-9]+"?[[:space:]]*$/ {
+                       sub(/^number:[[:space:]]*/,"",line); gsub(/["\r[:space:]]/,"",line); print line; exit
+                     }')"
+            # 纯数字校验（防脏字符流到 merge-pull 的 --number）。用 case 而不是
+            # `[ -eq ]`：`-eq` 在非数字时会报错，而这段跑在 errexit 下，
+            # 一个非零退出就能把整个阶段掐掉。
+            case "${PR_NO}" in
+              ''|*[!0-9]*) PR_NO="";;
+            esac
+            if [ -z "${PR_NO}" ]; then
+              echo "!! 未能从 post-pull 输出里解析出 PR 编号，内联合并无法执行。"
+              echo "   PR 可能已经创建，请在 PR 列表里手动合并它；或重跑本流水线。"
+              exit 1
+            fi
+            echo "已创建 PR #${PR_NO}"
+            echo "##[set-output AUTO_MERGE_PR=${PR_NO}]"
+          exports:
+            AUTO_MERGE_PR: AUTO_MERGE_PR
+        - name: merge-pr-inline
+          # 无人值守的收口：开完 PR 就地把它合掉，不再依赖 pull_request.mergeable
+          # （那个事件只在保护分支上触发，而 NPC 无权替用户创建保护分支规则）。
+          # 只合并本轮自己开的那个 PR 编号，人在仓库里提的 PR 一律不动。
+          if: '[ "$SYNC_STATUS" = "merged" ] && [ -n "${AUTO_MERGE_PR:-}" ]'
+          script: |
+            set -euo pipefail
+            echo "合并 PR #${AUTO_MERGE_PR} → ${CNB_BRANCH}"
+            # `commit_title` 是平台必填项，缺了会直接 400：
+            # 用 PR 标题，保持提交信息可读。
+            TITLE="chore: 跟进参考上游项目 ${UPSTREAM_REPO##*/}（#${AUTO_MERGE_PR}）"
+            # 重试几次：刚创建的 PR 平台侧可能还在做可合并性检查（mergeable_state=checking），
+            # 此时合并会被拒。这是瞬态，退避重试即可，不要当成失败。
+            # 关键：这里**必须**给子命令加 `|| true`。
+            # `out="$(cmd)"` 里 cmd 非零退出时，外面的 `set -e` 会让脚本**当场静默退出**，
+            # 于是「重试 5 次」形同虚设 —— PR 明明是暂时的 checking 被拒，
+            # 流水线却直接挂掉，只剩一个没有任何输出的失败阶段（实测踩过）。
+            ok=0
+            for i in 1 2 3 4 5; do
+              out="$(cnb pulls merge-pull \
+                       --repo "$CNB_REPO_SLUG" \
+                       --number "${AUTO_MERGE_PR}" \
+                       --merge-style squash \
+                       --commit-title "${TITLE}" 2>&1 || true)"
+              echo "$out"
+              case "$out" in
+                *"merged: true"*) ok=1; break;;
+              esac
+              echo "第 ${i} 次合并未成功，5s 后重试…"
+              echo "$out" | sed 's/^/    /'
+              sleep 5
+            done
+            if [ "${ok}" != "1" ]; then
+              echo "❌ 自动合并失败：PR #${AUTO_MERGE_PR} 未能合入 ${CNB_BRANCH}。"
+              echo "   PR 链接：${CNB_WEB_ENDPOINT}/${CNB_REPO_SLUG}/-/pulls/${AUTO_MERGE_PR}"
+              echo "   同步内容已安全落在分支 ${AUTO_MERGE_BRANCH} 上，不会丢失："
+              echo "   在流水线页面重跑本流水线，或手动合并上述 PR 即可。"
+              exit 1
+            fi
+            echo "✅ 已自动合并 PR #${AUTO_MERGE_PR}"
+        - name: report
+          # 无论成功失败都汇报一次，方便日后回看这一轮到底做了什么
+          if: always()
+          script: |
+            case "${SYNC_STATUS:-}" in
+              merged)       echo "✅ 参考项目有更新，已提交，并在同一轮流水线内自动合并到 ${CNB_BRANCH}（无需人工）";;
+              no-update)    echo "⏭️ 参考项目无更新，忽略本次（不推送、不开 PR）";;
+              empty)        echo "⏭️ 参考项目内容为空，忽略本次";;
+              skipped)      echo "⚠️ 参考项目改动与本地并发改动重叠，本次保留本地版本、跳过参考项目改动（详见上方冲突清单）";;
+              fetch-failed) echo "⚠️ 参考项目拉取失败（网络/权限/仓库不存在），本次跳过";;
+              *)            echo "❓ 未知状态：${SYNC_STATUS:-}";;
+            esac
+            # 参考项目使用 LFS 时明确说明，避免用户误以为同步漏了大文件
+            if [ "${SYNC_LFS:-0}" = "1" ]; then
+              echo "📦 参考上游项目使用 Git LFS：已同步真身内容，并以 LFS 方式入库（仓库内只存指针）"
+            fi
+            echo "参考上游项目仓库：${UPSTREAM_REPO:-}"
+      failStages:
+        - name: conflict-notice
+          script: |
+            echo "❌ 参考上游项目失败，本次未推送任何变更。"
+            echo "   常见原因：① 合并冲突；② 参考项目使用 LFS 但对象拉不到（此时不会提交指针文件）"
+            echo "工作区已中止合并、保持干净；请人工解决冲突后重跑本流水线。"
+            echo "参考上游项目仓库：${UPSTREAM_REPO:-}"
+            echo "本地排查："
+            echo "  git fetch ${UPSTREAM_REPO:-<upstream>} ${UPSTREAM_BRANCH:-main}"
+            echo "  git merge upstream/${UPSTREAM_BRANCH:-main}"
+
+  # ---------- 引导 PR 自我了结（合并后自动删源分支） ----------
+  #
+  # 背景：同步官初装时开的是「引导 PR」（源分支 <BOOTSTRAP_BRANCH>）。它提交的
+  # `.cnb/git-sync.yml` 里**已经带了定时任务与自动合并配置**，所以那个 PR 一合并，
+  # 目标分支立刻就有定时任务了。
+  #
+  # 但只有「有更新」时同步任务才会落地 + 自动合并。参考上游项目当前内容与仓库一致时是
+  # `no-update` —— 不推送、不开 PR。此时**没人去合并那个还开着的引导 PR**，
+  # 它就会一直挂在 PR 列表里等人，用户看到的正是「配了全自动，却有个 PR 没人处理」。
+  #
+  # 所以这里补一刀：引导 PR **由本流水线自己触发、自己合并、自己删源分支**。
+  #   - 只认源分支名恰为 <BOOTSTRAP_BRANCH>：人在这个仓库提的 PR 一律不动
+  #   - 合并不判断评审：这是机器人开的自家 PR，要的是「合并即生效、随后无人值守」；
+  #     若按 pull_request.mergeable 走，又会卡在「需要评审人批准」上
+  #   - 删掉引导分支：不留孤儿分支，也不给下次同步留下「本地 HEAD 没更新」的观感
+  #
+  # 合并完这一条，控制权就完全交给上面的 crontab：之后一律自动跑、自动开 PR、自动合并。
+  # 这一条流水线在引导分支被删之后自然不再触发，属于「用完即退役」。
+  pull_request.merged:
+    - name: bootstrap-pr-self-resolve
+      runner:
+        cpus: <RUNNER_CPUS>
+      docker:
+        image: cnbcool/default-build-env
+      stages:
+        - name: delete-bootstrap-branch
+          # 只清理同步官初装用的引导分支；其他 PR 合并后不动人家的分支
+          # （不要写成 ${CNB_PULL_REQUEST_BRANCH#<BOOTSTRAP_BRANCH>} 那种判定：
+          #  分支名以引导分支名开头时会被误命中）
+          if: '[ "${CNB_PULL_REQUEST_BRANCH}" = "${BOOTSTRAP_BRANCH}" ]'
+          script: |
+            set -euo pipefail
+            echo "引导 PR（源分支 ${CNB_PULL_REQUEST_BRANCH}）已合并，清理该分支。"
+            # 分支已不存在（如被平台自动删除）时不算失败
+            git push origin --delete "${CNB_PULL_REQUEST_BRANCH}" \
+              || echo "分支已不存在或已删除，忽略。"
+
+  # 兜底路径：默认分支**恰好**是保护分支时，PR 还会触发这里。
+  # 正常情况下 PR 早就被定时流水线的 merge-pr-inline 阶段合掉了，
+  # 这里再跑一次只会落空（PR 已合并/已关闭，git:auto-merge 会跳过），属幂等。
+  # 保留它的意义：保护分支场景下多一层平台原生的复核式合并。
+  # 与上面的同步共用同一份环境变量；crontab 与 pull_request.mergeable 是
+  # 并列的两条流水线，互不影响。
+  pull_request.mergeable:
+    - name: sync-upstream-auto-merge
+      runner:
+        cpus: <RUNNER_CPUS>
+      docker:
+        image: cnbcool/default-build-env
+      stages:
+        - name: auto-merge
+          # 无人值守的收口：只有本流水线创建的同步 PR 才自动合并，
+          # 人在这个仓库提的其他 PR 一律不动（不抢人工评审的活）。
+          if: '[ "${CNB_PULL_REQUEST_BRANCH#sync/upstream-auto}" != "${CNB_PULL_REQUEST_BRANCH}" ]'
+          type: git:auto-merge
+          options:
+            mergeType: squash
+            removeSourceBranch: true
+            ignoreAssignee: true

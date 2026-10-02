@@ -1,0 +1,516 @@
+# 本仓库自身的守护流水线（参考上游项目 i.o/sync@49658d0，适配本仓结构）
+#
+# 做五件事：
+#   1. 每天检查同步官角色与技能文件是否齐全，避免技能仓库自身腐化
+#   2. 校验 bootstrap-skills.sh 能把技能装进 NPC 的自动加载目录（含跨仓自举路径）
+#   3. 跑同步脚本场景回归，守住平铺/子目录/铺源/无人值守/LFS/私有参考项目令牌、
+#      空仓库默认分支跟随参考上游项目、内联合并（免保护分支）、命令替换不吃 errexit 等全部行为
+#   4. 官方技能锁文件过期检测（PR #14 评审遗留：computedHash 真锁版本后，
+#      官方技能仓库静默更新本仓不会自动跟进）——过期即告警，等 owner 人工刷锁
+#   5. 官方技能仓库自动跟进：锁文件过期时自动重算 hash 刷锁，经分支 skills/auto-update
+#      开 PR（up-to-date 零噪音），人工评审合并后生效。默认行为是「自动跟进」；
+#      改回「只告警不刷」：把 stage auto-update-skills-lock 改为 SKILLS_AUTO_UPDATE=0
+# 不做任何代码同步——代码同步由「引用方仓库」自己的流水线负责（见 .ci/git-sync.yml）。
+# 前四个 stage（selftest/convention/lfs/bootstrap）同时供 PR CI 复用（见 .skill-selftest 锚点）。
+# 自检 stage 模板（隐藏 key，不构成分支）：每日 04:23 定时自检与 PR CI（.cnb.yml
+# main 分支 pull_request，目标分支匹配口径）共用同一份 stages——!reference [.skill-selftest, selftest_stages]
+# 引用，防两处漂移。detect/auto-update 两 stage 依赖 crontab 场景的上下文
+# （SKILLS_LOCK_STATUS 导出、CNB_BRANCH 定位），不进 PR CI，只留在每日自检。
+.skill-selftest:
+  selftest_stages: &selftest_stages
+      - name: selftest
+        script: |
+          set -euo pipefail
+          echo "== npc 仓自检 =="
+          for f in skills/sync-upstream/SKILL.md \
+                   skills/sync-upstream/scripts/sync-upstream.sh \
+                   skills/sync-upstream/scripts/sync-upstream-target.sh \
+                   skills/sync-upstream/scripts/tests/run-tests.sh \
+                   .cnb/bootstrap-skills.sh \
+                   skills-lock.json \
+                   .ci/git-sync.yml \
+                   .ci/watchdog.yml \
+                   .cnb/settings.yml \
+                   .cnb.yml; do
+            [ -f "$f" ] || { echo "❌ 缺失：$f"; exit 1; }
+            echo "✅ $f"
+          done
+          bash -n skills/sync-upstream/scripts/sync-upstream.sh
+          bash -n skills/sync-upstream/scripts/sync-upstream-target.sh
+          bash -n .cnb/bootstrap-skills.sh
+          echo "✅ 脚本语法检查通过"
+
+      - name: convention-selftest
+        # 守住约定：git-sync.yml 模板占位符不被写死、频率默认一天一次、LFS 能力不丢
+        script: |
+          set -euo pipefail
+          # 先自报「本次校验的是哪份工作区」：PR CI 的工作区可能因推送/检出竞态
+          # 落在旧修订上，届时下面的断言会以「模板丢东西」的口吻报错，极易被误读成
+          # 内容 bug（实测踩过：构建在提交后仅数秒启动，检出的 git-sync.yml 是中间态）。
+          # 把文件指纹与关键标记打出来，一眼就能分辨是内容真丢了还是检出过期。
+          echo "== 工作区身份 =="
+          echo "  HEAD = $(git rev-parse HEAD 2>/dev/null || echo '<无 git 信息>')"
+          echo "  git-sync.yml sha256 = $(sha256sum .ci/git-sync.yml 2>/dev/null | awk '{print $1}')"
+          # 注意：`grep -c` 命中 0 条时退出码是 1，而本段跑在 errexit 下——
+          # 不兜 `|| true` 会**静默掐掉整个阶段**（正是本 PR 要防的那类坑）。
+          M_MPI="$(grep -c 'name: merge-pr-inline' .ci/git-sync.yml 2>/dev/null || true)"
+          M_AMP="$(grep -c 'AUTO_MERGE_PR' .ci/git-sync.yml 2>/dev/null || true)"
+          echo "  git-sync.yml 命中标记：merge-pr-inline=${M_MPI}, AUTO_MERGE_PR=${M_AMP}"
+          echo "  （若两者中 merge-pr-inline>0 而 AUTO_MERGE_PR=0，说明检出的是中间态而非本修订）"
+          # ---- 去掉注释行的模板内容，一次性物化到变量 ----
+          # 下面「排除注释行再匹配」的断言如果写成
+          #   grep -vE '^[[:space:]]*#' .ci/git-sync.yml | grep -q '<关键词>'
+          # 会踩一个**时序性**的坑：`grep -q` 命中首个匹配就立刻退出，参考上游项目
+          # `grep -vE` 若还有内容没写完就会收到 SIGPIPE（退出码 141）；
+          # 而本阶段跑在 `set -o pipefail` 下，141 会被当成整条管道的结果，
+          # 断言于是误报「模板丢了内容」——内容其实在（实测 PR #16：模板里
+          # AUTO_MERGE_PR 命中 9 处，断言却报退出码 141）。
+          # 是否被打断取决于管道缓冲与调度：小文件（全部输入能塞进管道缓冲区）
+          # 稳定通过，29KB 的真模板在 CI runner 上就会被打断——同一份代码
+          # 本地绿、CI 红，是个假阴性式的 flaky。
+          # 修法：把过滤结果**先物化**，断言只对变量做单进程 grep——没有参考上游项目
+          # 生产者可供打断，SIGPIPE 无从发生；退出码也就如实反映「有没有命中」。
+          # 注意 `grep -c` 命中 0 条退出码为 1，且本段在 errexit 下，须兜 `|| true`。
+          TPL_FILTERED="$(grep -vE '^[[:space:]]*#' .ci/git-sync.yml || true)"
+          # has <正则/字面量> [grep 附加参数...]：对「去注释后的模板」做单进程 grep。
+          # 这里用 here-string（bash 会落成临时文件 fd）而不是 `printf | grep -q`——
+          # printf 同样会被提前退出的 grep -q 打断（SIGPIPE 141），把 has() 变成新的
+          # flaky 源。here-string 无参考上游项目进程，结构上不可能 SIGPIPE。
+          has() {
+            local _pat="$1"; shift
+            grep -q "$@" -- "${_pat}" <<< "${TPL_FILTERED}"
+          }
+          grep -q '<CRON>' .ci/git-sync.yml || { echo "❌ git-sync.yml 丢了 <CRON> 占位符，频率被写死了"; exit 1; }
+          grep -q '<RUNNER_CPUS>' .ci/git-sync.yml || { echo "❌ git-sync.yml 丢了 <RUNNER_CPUS> 占位符，机型被写死了"; exit 1; }
+          grep -q '默认一天一次\|默认每天一次' skills/sync-upstream/SKILL.md || { echo "❌ SKILL.md 未声明「默认一天一次」"; exit 1; }
+          # ---- yaml script 块内禁 heredoc（2026-09-30 实录，构建 cnb-hkh-1k3ndbf9v）----
+          # heredoc 结束符随 yaml 块缩进即**永不闭合**：平台 sh -c 识别不到它，heredoc 吞掉
+          # 脚本后半段——症状是「后续动作静默不执行 + unexpected EOF」而非报错在出错行，
+          # auto-update 链首次触发即断（刷锁落盘但 commit/push/PR 全未跑）。多行字符串一律
+          # printf 拼接。here-string（<<<）是单行安全形态，放行；<<XXX / <<-XXX 一律拦截。
+          YAML_HEREDOC_HITS="$(awk '
+            /script: \|/ { inblk=1; next }
+            inblk && /^[^ ]/ && !/^$/ { inblk=0 }
+            inblk && /<</ && ! /<<</ { print FILENAME ":" NR ": " $0 }
+          ' .cnb.yml .ci/git-sync.yml .ci/watchdog.yml || true)"
+          [ -z "${YAML_HEREDOC_HITS}" ] \
+            || { echo "❌ yaml script 块内出现 heredoc（结束符随缩进永不闭合会吞掉后续行——改 printf 拼接）："; printf '%s\n' "${YAML_HEREDOC_HITS}"; exit 1; }
+          echo "✅ yaml script 块零 heredoc（多行字符串一律 printf 拼接）"
+          # 守住 LFS 自动处理这条能力：探测函数与「拿不到真身就中止」都不能丢
+          grep -q 'detect_lfs_in_tree' skills/sync-upstream/scripts/sync-upstream.sh \
+            || { echo "❌ sync-upstream.sh 丢了 LFS 自动探测函数"; exit 1; }
+          grep -q 'LFS_INCOMPLETE' skills/sync-upstream/scripts/sync-upstream.sh \
+            || { echo "❌ sync-upstream.sh 丢了 LFS 不完整判定"; exit 1; }
+          grep -q 'smudge_lfs_files' skills/sync-upstream/scripts/sync-upstream.sh \
+            || { echo "❌ sync-upstream.sh 丢了 LFS 真身还原"; exit 1; }
+          grep -q 'Git LFS' skills/sync-upstream/SKILL.md \
+            || { echo "❌ SKILL.md 未声明 LFS 处理能力"; exit 1; }
+          # 同步官角色与事件绑定必须存在且逐字一致
+          grep -q 'name: 同步官' .cnb/settings.yml || { echo "❌ settings.yml 缺同步官角色"; exit 1; }
+          grep -q '^同步官:' .cnb.yml || { echo "❌ .cnb.yml 缺同步官事件绑定"; exit 1; }
+          # 私有参考项目令牌通道（单一来源，owner 决策 2026-09-23 Issue #13）：
+          # 脚本收编运行环境令牌（CNB_MIRROR_TOKEN/GH_TOKEN → UPSTREAM_TOKEN），
+          # fetch 前临时注入、fetch 后（含失败分支）还原匿名 URL，凭证不残留
+          grep -q 'UPSTREAM_TOKEN="\${UPSTREAM_TOKEN:-\${CNB_MIRROR_TOKEN:-\${GH_TOKEN:-}}}"' skills/sync-upstream/scripts/sync-upstream.sh \
+            || { echo "❌ sync-upstream.sh 丢了环境令牌收编（私有参考项目通道被破坏）"; exit 1; }
+          ! grep -q 'UPSTREAM_TOKEN_FILE' skills/sync-upstream/scripts/sync-upstream.sh \
+            || { echo "❌ sync-upstream.sh 残留 UPSTREAM_TOKEN_FILE（通道②已移除）"; exit 1; }
+          ! grep -q '<IMPORTS_TOKEN_BLOCK>' .ci/git-sync.yml \
+            || { echo "❌ git-sync.yml 残留 <IMPORTS_TOKEN_BLOCK> 占位（通道②已移除）"; exit 1; }
+          grep -q 'UPSTREAM_TOKEN' .ci/git-sync.yml \
+            || { echo "❌ git-sync.yml 丢了 UPSTREAM_TOKEN 注入说明（私有参考项目通道被破坏）"; exit 1; }
+          grep -q 'set-url upstream "${UPSTREAM_REPO}"' skills/sync-upstream/scripts/sync-upstream.sh \
+            || { echo "❌ sync-upstream.sh 丢了 fetch 后还原匿名 URL 的步骤（凭证泄漏风险）"; exit 1; }
+          # fetch 失败分支也必须还原匿名 URL（评审修复 2026-09-23：失败 exit 前同样清凭证）
+          FETCH_FAIL_BLOCK="$(sed -n '/if ! git fetch --no-tags/,/^fi$/p' skills/sync-upstream/scripts/sync-upstream.sh || true)"
+          grep -q 'set-url upstream "${UPSTREAM_REPO}"' <<< "${FETCH_FAIL_BLOCK}" \
+            || { echo "❌ sync-upstream.sh fetch 失败分支未还原匿名 URL（凭证残留风险）"; exit 1; }
+          # bootstrap 必须逐技能校验 computedHash（真锁版本，评审修复 2026-09-23）
+          grep -q 'computedHash' .cnb/bootstrap-skills.sh \
+            || { echo "❌ bootstrap-skills.sh 丢了 computedHash 校验（锁的是路径不是版本）"; exit 1; }
+          grep -q 'sha256sum' .cnb/bootstrap-skills.sh \
+            || { echo "❌ bootstrap-skills.sh 丢了 sha256sum 实算（hash 校验形同虚设）"; exit 1; }
+          # 官方技能仓库自动跟进（PR #14 评审遗留补齐）：脚本与流水线绑定都不能丢
+          [ -f .ci/refresh-skills-lock.sh ] \
+            || { echo "❌ 缺失：.ci/refresh-skills-lock.sh（官方技能仓库自动跟进脚本）"; exit 1; }
+          bash -n .ci/refresh-skills-lock.sh \
+            || { echo "❌ .ci/refresh-skills-lock.sh 语法错误"; exit 1; }
+          grep -q 'SKILLS_LOCK_STATUS' .ci/refresh-skills-lock.sh \
+            || { echo "❌ refresh-skills-lock.sh 丢了 SKILLS_LOCK_STATUS 输出（stale/up-to-date 判据失效）"; exit 1; }
+          grep -q 'SKILLS_AUTO_UPDATE' .ci/watchdog.yml \
+            || { echo "❌ watchdog.yml 丢了 SKILLS_AUTO_UPDATE 自动跟进开关（锁过期只剩人工兜底）"; exit 1; }
+          # 同步官事件流水线须保留密钥 imports（owner 决策 2026-09-23，Issue #13：
+          # 注入 CNB_MIRROR_TOKEN/GH_TOKEN 兼作私有参考项目拉取凭证）——两个事件都要有，防回退
+          CNB_YML_SYNC="$(awk '/^同步官:/,0' .cnb.yml || true)"
+          n_imports="$(grep -c 'dev-signing-secrets.yml' <<< "${CNB_YML_SYNC}")"
+          [ "${n_imports}" -ge 2 ] \
+            || { echo "❌ .cnb.yml 同步官事件缺密钥 imports（期望 issue+PR 两事件各 1 处，实际 ${n_imports}）"; exit 1; }
+          # ---- 省 token 约定（参考上游项目 i.o/sync cost-selftest 同款）----
+          grep -q 'SEED_SOURCE' skills/sync-upstream/scripts/sync-upstream.sh \
+            || { echo "❌ sync-upstream.sh 丢了 SEED_SOURCE 铺源路径"; exit 1; }
+          grep -q -- '--depth 1' skills/sync-upstream/scripts/sync-upstream.sh \
+            || { echo "❌ 铺源路径丢了浅克隆（--depth 1）"; exit 1; }
+          grep -q 'git reset -q --soft "${PRE_HEAD}"' skills/sync-upstream/scripts/sync-upstream.sh \
+            || { echo "❌ 铺源提交没把父提交钉在本地 HEAD 上"; exit 1; }
+          grep -q 'HAS_COMMON_ANCESTOR' skills/sync-upstream/scripts/sync-upstream.sh \
+            || { echo "❌ sync-upstream.sh 丢了「有无共同祖先」判定，无共同祖先时会静默丢改动"; exit 1; }
+          ! grep -q 'allow-unrelated-histories' skills/sync-upstream/scripts/sync-upstream.sh \
+            || { echo "❌ 又用上了 --allow-unrelated-histories：无共同祖先时应走快照式"; exit 1; }
+          [ -f skills/sync-upstream/scripts/sync-upstream-target.sh ] \
+            || { echo "❌ 缺 skills/sync-upstream/scripts/sync-upstream-target.sh"; exit 1; }
+          grep -q 'SEED_SOURCE' skills/sync-upstream/scripts/sync-upstream-target.sh \
+            || { echo "❌ 目标仓库脚本丢了铺源支持"; exit 1; }
+          grep -q 'SYNC_QUIET' skills/sync-upstream/scripts/sync-upstream-target.sh \
+            || { echo "❌ 目标仓库脚本丢了静默模式"; exit 1; }
+          grep -q 'SYNC_NO_PUSH' skills/sync-upstream/scripts/sync-upstream-target.sh \
+            || { echo "❌ 目标仓库脚本丢了「只提交不推送」模式（自动合并链路要用）"; exit 1; }
+          # ---- 下发脚本 × LFS 防回退（PR #15 评审遗留：铺源路径漏了探测/还原，
+          #      参考项目是 LFS 项目时 131 字节指针会直接落进首个提交，内容静默丢失）----
+          grep -q 'detect_upstream_lfs' skills/sync-upstream/scripts/sync-upstream-target.sh \
+            || { echo "❌ 下发脚本丢了 LFS 探测（参考项目是 LFS 项目时会交指针文件）"; exit 1; }
+          grep -q 'restore_lfs' skills/sync-upstream/scripts/sync-upstream-target.sh \
+            || { echo "❌ 下发脚本丢了 LFS 真身还原（指针会当成功提交）"; exit 1; }
+          grep -q 'abort_if_lfs_incomplete' skills/sync-upstream/scripts/sync-upstream-target.sh \
+            || { echo "❌ 下发脚本丢了「真身拿不到就中止」（会把指针当同步成功）"; exit 1; }
+          # 探测要跑在「持有参考项目的那一侧」：clone 路径不指定仓库目录就会拿
+          # 目标仓库的 HEAD 去探，永远探不到 LFS（实测踩过）。
+          grep -q 'detect_upstream_lfs "HEAD" "${STASH}/upstream"' skills/sync-upstream/scripts/sync-upstream-target.sh \
+            || { echo "❌ clone 路径的 LFS 探测没指向 staging 参考上游项目克隆（会永远探不到）"; exit 1; }
+          grep -q 'restore_lfs "${STASH}/upstream" "origin"' skills/sync-upstream/scripts/sync-upstream-target.sh \
+            || { echo "❌ clone 路径的 LFS 真身没从 staging（origin 持有方）拉，会静默失败"; exit 1; }
+          grep -q 'GIT_LFS_SKIP_SMUDGE=1 git clone' skills/sync-upstream/scripts/sync-upstream-target.sh \
+            || { echo "❌ clone 没关 smudge：参考项目 LFS 对象缺失时 clone 会硬失败而非走 LFS 中止"; exit 1; }
+          # 铺源成功也要给 merged：否则流水线无法区分「铺源成功」与「脚本半途死掉」
+          # 同源坑：`grep -c ... | grep -q` 也带 SIGPIPE 竞态 → 先物化再比较
+          N_MERGED="$(grep -c '##\[set-output SYNC_STATUS=merged\]' skills/sync-upstream/scripts/sync-upstream-target.sh || true)"
+          [ "${N_MERGED:-0}" -ge 2 ] \
+            || { echo "❌ 下发脚本只在一处报 merged（铺源路径漏报，流水线分不清成功/失败）"; exit 1; }
+          # ---- 无人值守约定（参考上游项目 automerge-selftest 核心）----
+          # 说明：这些断言先 grep 掉注释行（^[[:space:]]*#），否则「注释里提到过某个词」
+          # 也会让断言假通过 —— 早期踩过这个坑。
+          # 注意：用 POSIX 类 [[:space:]] 而不是 \s —— 部分精简镜像的 grep 不认 \s，
+          # 会直接报错退出（这点仍然成立，保留 POSIX 类）。
+          # 但 PR #16 CI 红并非此因：真正的坑是下游 `grep -q` 提前退出、
+          # 参考上游项目 `grep -vE` 收到 SIGPIPE(141) 被 pipefail 放大成断言失败，
+          # 详见下方 TPL_FILTERED / has() 处的完整说明。
+          #
+          # 1) 主收口必须是「内联直接合并」：定时流水线开完 PR 就地合掉，
+          #    不依赖 pull_request.mergeable / 保护分支 / 评审人。
+          has 'name: merge-pr-inline' \
+            || { echo "❌ .ci/git-sync.yml 丢了 merge-pr-inline 阶段，无人值守不成立"; exit 1; }
+          has 'cnb pulls merge-pull' \
+            || { echo "❌ 内联合并没调 merge-pull，PR 会挂着等人合"; exit 1; }
+          has '--commit-title' \
+            || { echo "❌ merge-pull 少了 --commit-title（平台必填，缺了会 400）"; exit 1; }
+          has 'AUTO_MERGE_PR' \
+            || { echo "❌ 内联合并没有用本轮 PR 编号，有误合并他人 PR 的风险"; exit 1; }
+          # 兜底路径可以留着，但它不该是唯一收口
+          grep -q 'pull_request.mergeable:' .ci/git-sync.yml \
+            || { echo "❌ .ci/git-sync.yml 丢了 pull_request.mergeable 兜底触发"; exit 1; }
+          grep -q 'type: git:auto-merge' .ci/git-sync.yml \
+            || { echo "❌ .ci/git-sync.yml 丢了 git:auto-merge 兜底阶段"; exit 1; }
+          # 2) 兜底路径仍只自动合并「自己开的」PR
+          grep -q 'CNB_PULL_REQUEST_BRANCH#sync/upstream-auto' .ci/git-sync.yml \
+            || { echo "❌ 自动合并没限定源分支前缀，会把人提的 PR 也自动合并掉"; exit 1; }
+          grep -qE 'if: .*SYNC_STATUS.*merged' .ci/git-sync.yml \
+            || { echo "❌ 开 PR / 推送阶段丢了 SYNC_STATUS=merged 门槛"; exit 1; }
+          grep -q 'SYNC_NO_PUSH: "1"' .ci/git-sync.yml \
+            || { echo "❌ 模板没把脚本设为「只提交不推送」"; exit 1; }
+          # 3) 回归拦截：不许再把「保护分支」当成无人值守的前置条件。
+          #    NPC token 没有 repo-manage:rw，根本创不了保护分支规则；
+          #    要求用户去设置里点几下，本身就不是无人值守。
+          #
+          #    判据沿革（PR #16 评审遗留，勿改回）：原判据是
+          #      has '不是保护分支。$' -E
+          #    但模板里那行是「…不是保护分支：不影响，本轮由内联 merge-pull 直接合并。」
+          #    —— 以引号结尾，`。$` 永远不命中。这条守卫**恒假**，它挡住退化靠的是
+          #    「永不命中」，而不是「模板里真没有」，等于没守（同类：run-tests.sh
+          #    里同源断言期望 0）。
+          #
+          #    简单去掉 `$` 会误伤：模板全仓只命中 1 处 `不是保护分支`，正是那句
+          #    **无害的只读探测兜底说明**（PROT=false 分支的日志）。改守更本质的判据：
+          #    「逼用户去仓库设置里开保护分支」这类文案必须为 0 —— 这才是「拿保护分支
+          #    当无人值守前置」的直接痕迹（原始退化版本就是这么引导用户的）。
+          #    用 -c 数命中数再比较（不用 `grep -q` 短路，不给 SIGPIPE 留口子）。
+          N_SETTINGS_HINT="$(grep -cF '设置路径：仓库「设置」' <<< "${TPL_FILTERED}" || true)"
+          [ "${N_SETTINGS_HINT:-0}" -eq 0 ] \
+            || { echo "❌ 模板又在引导用户去仓库设置里开保护分支（无人值守被当前置条件）"; exit 1; }
+          N_ASSUME_PROTECTED="$(grep -cF '逼用户去设置' <<< "${TPL_FILTERED}" || true)"
+          [ "${N_ASSUME_PROTECTED:-0}" -eq 0 ] \
+            || { echo "❌ 模板又把「保护分支」当成了无人值守前置条件（会逼用户去设置）"; exit 1; }
+          # 4) 引导 PR 收口
+          grep -q '^  pull_request\.merged:' .ci/git-sync.yml \
+            || { echo "❌ .ci/git-sync.yml 丢了 pull_request.merged，引导 PR 会一直挂着"; exit 1; }
+          grep -qE '^[[:space:]]+BOOTSTRAP_BRANCH: <BOOTSTRAP_BRANCH>$' .ci/git-sync.yml \
+            || { echo "❌ 模板把引导分支名写死了（应为 <BOOTSTRAP_BRANCH> 占位符）"; exit 1; }
+          grep -q 'git push origin --delete "\${CNB_PULL_REQUEST_BRANCH}"' .ci/git-sync.yml \
+            || { echo "❌ 引导 PR 合并后没删源分支，会留下孤儿分支"; exit 1; }
+          grep -q '建完立刻自己合掉' skills/sync-upstream/SKILL.md \
+            || { echo "❌ SKILL.md 没要求同步官建完引导 PR 就地合并，用户又会看到挂着的 PR"; exit 1; }
+          grep -q 'UPSTREAM_URL="\${UPSTREAM_REPO}"' .ci/git-sync.yml \
+            || { echo "❌ 模板没把 UPSTREAM_REPO 映射成脚本要读的 UPSTREAM_URL"; exit 1; }
+          grep -q 'SYNC_DIR="\${TARGET_DIR}"' .ci/git-sync.yml \
+            || { echo "❌ 模板没把 TARGET_DIR 映射成脚本要读的 SYNC_DIR"; exit 1; }
+
+          # ---- 空仓库默认分支必须由流水线初始化 + 跟随参考上游项目 ----
+          grep -qE '^[[:space:]]*- name: init-default-branch$' .ci/git-sync.yml \
+            || { echo "❌ 模板丢了 init-default-branch 阶段，新仓库默认分支又会被带歪"; exit 1; }
+          grep -q 'git push -f origin "HEAD:refs/heads/\${DESIRED_BRANCH}"' .ci/git-sync.yml \
+            || { echo "❌ 模板没有把默认分支推到远端，空仓库的默认分支不会被正确初始化"; exit 1; }
+          grep -q 'git ls-remote --heads origin' .ci/git-sync.yml \
+            || { echo "❌ 模板没做「仓库是否已有远端分支」判断，会改写已有仓库的分支结构"; exit 1; }
+          awk '/- name: init-default-branch/{a=NR} /- name: fetch-and-merge-upstream/{b=NR} END{exit !(a && b && a<b)}' .ci/git-sync.yml \
+            || { echo "❌ init-default-branch 必须在同步阶段之前（否则首次 push 已经发生）"; exit 1; }
+          grep -q '由本流水线负责初始化' .ci/git-sync.yml \
+            || { echo "❌ 模板没把「空仓库默认分支由流水线初始化」写进注释，后来人不知道为什么要这一步"; exit 1; }
+          grep -qE '^[[:space:]]*- name: resolve-default-branch$' .ci/git-sync.yml \
+            || { echo "❌ 模板丢了 resolve-default-branch 阶段，空仓库默认分支又会被硬编码成 main"; exit 1; }
+          grep -q 'ls-remote --symref' .ci/git-sync.yml \
+            || { echo "❌ 模板没探测参考项目默认分支，「跟随参考上游项目」不可能成立"; exit 1; }
+          ! grep -q "sed -n 's#\^ref: refs/heads" .ci/git-sync.yml \
+            || { echo "❌ 又用 sed 捕获组取分支名了：会把 symref 输出尾部的 tab 吞进分支名"; exit 1; }
+          grep -q 'ref: refs\\/heads' .ci/git-sync.yml \
+            || { echo "❌ 没找到 awk 形式的分支名解析，跟随参考上游项目这条链路不完整"; exit 1; }
+          awk '/- name: resolve-default-branch/{a=NR} /- name: init-default-branch/{b=NR} END{exit !(a && b && a<b)}' .ci/git-sync.yml \
+            || { echo "❌ resolve-default-branch 必须在 init-default-branch 之前"; exit 1; }
+          grep -q 'LOCAL_BRANCHES' .ci/git-sync.yml \
+            || { echo "❌ 模板没确认「本地是否已有分支」就采信 CNB_DEFAULT_BRANCH，空仓库上会退化成硬编码 main"; exit 1; }
+          grep -q 'cat .git/sync-default-branch' .ci/git-sync.yml \
+            || { echo "❌ init-default-branch 没读 resolve 阶段的结果，两处分支名可能对不上"; exit 1; }
+          grep -q '空仓库首次上车：默认分支跟随参考上游项目' .ci/git-sync.yml \
+            || { echo "❌ 模板里没有「跟随参考项目默认分支」的显式分支，行为可能被改掉"; exit 1; }
+          grep -q '默认分支跟随参考上游项目' skills/sync-upstream/SKILL.md \
+            || { echo "❌ SKILL.md 没声明「空仓库默认分支跟随参考上游项目」的口径"; exit 1; }
+          grep -q 'CNB_DEFAULT_BRANCH.*不能直接信' .cnb/settings.yml \
+            || { echo "❌ 角色提示词没交代「CNB_DEFAULT_BRANCH 不能直接信」，会绕回硬编码 main"; exit 1; }
+          grep -q '跟随参考上游项目' README.md \
+            || { echo "❌ README 没讲「默认分支跟随参考上游项目」"; exit 1; }
+          # 5.95) 下发脚本不许凭空造出一个 main 分支
+          grep -qE '^TARGET_BRANCH="\$\{TARGET_BRANCH:-\}"' \
+            skills/sync-upstream/scripts/sync-upstream-target.sh \
+            || { echo "❌ 下发脚本又把 TARGET_BRANCH 默认成某个分支，会凭空造出 main"; exit 1; }
+          ! grep -q 'TARGET_BRANCH:-main' skills/sync-upstream/scripts/sync-upstream-target.sh \
+            || { echo "❌ 下发脚本里还有 TARGET_BRANCH:-main 兜底，空仓库上车会多出一个 main"; exit 1; }
+          grep -q '默认分支' skills/sync-upstream/SKILL.md \
+            || { echo "❌ SKILL.md 没交代空仓库默认分支的处理"; exit 1; }
+          grep -q '第一个远端分支就是该仓库的默认分支' skills/sync-upstream/SKILL.md \
+            || { echo "❌ SKILL.md 没解释「空仓库第一个远端分支=默认分支」这个机制"; exit 1; }
+          grep -q 'init-default-branch' skills/sync-upstream/SKILL.md \
+            || { echo "❌ SKILL.md 没讲模板里的 init-default-branch 阶段"; exit 1; }
+          grep -q 'resolve-default-branch' skills/sync-upstream/SKILL.md \
+            || { echo "❌ SKILL.md 没讲模板里的 resolve-default-branch 阶段"; exit 1; }
+          grep -q '空仓库的默认分支：跟随参考上游项目' .cnb/settings.yml \
+            || { echo "❌ 角色提示词没交代「空仓库默认分支要跟随参考上游项目」，初装仍会推错第一个分支"; exit 1; }
+          grep -q '初始化默认分支' .cnb/settings.yml \
+            || { echo "❌ 角色提示词里没有建默认分支的命令示例"; exit 1; }
+          grep -q '默认分支：空仓库时跟随参考上游项目' README.md \
+            || { echo "❌ README 没讲空仓库默认分支如何确定"; exit 1; }
+
+          # ---- 模板里的命令替换不许吃掉 errexit 兜底（静默失败防线）----
+          [ "$(grep -c -- '2>&1 || true)"' <<< "${TPL_FILTERED}")" -ge 2 ] \
+            || { echo "❌ 内联合并又没给 merge-pull 加 \`|| true\`：第一次瞬态被拒就会静默掐掉整个阶段"; exit 1; }
+          [ "$(grep -c -- '--page-size 100 2>/dev/null || true; }' <<< "${TPL_FILTERED}")" -ge 1 ] \
+            || { echo "❌ 保护状态探测没容错：cnb CLI 报错时 \`set -e\` 会静默掐掉整个推送/开 PR 阶段"; exit 1; }
+          grep -q 'set -uo pipefail' .ci/git-sync.yml \
+            || { echo "❌ resolve-default-branch 又开了 errexit：参考上游项目探测失败时会静默退出，兜底分支跑不到"; exit 1; }
+          awk '/- name: resolve-default-branch/{f=1} f&&/set -euo pipefail/{bad=1} /- name: init-default-branch/{f=0} END{exit bad}' .ci/git-sync.yml \
+            || { echo "❌ resolve-default-branch 阶段里出现了 errexit，探测失败会静默中止"; exit 1; }
+          grep -q "tr -d '\[:space:\]'" .ci/git-sync.yml \
+            || { echo "❌ 参考项目默认分支名没有做空白清洗，脏分支名会 push 出非法 ref"; exit 1; }
+          grep -qF 'UP_SDB}" = "HEAD"' .ci/git-sync.yml \
+            || { echo "❌ 没兜掉 --symref 输出里可能出现在首位的 HEAD"; exit 1; }
+          grep -qF 'sub(/^[[:space:]]+/,"",line)' .ci/git-sync.yml \
+            || { echo "❌ PR 编号解析退回了「只认行首 number:」，缩进输出会解析失败、PR 又没人合"; exit 1; }
+          grep -q 'PROT="unknown"' .ci/git-sync.yml \
+            || { echo "❌ 保护状态探测没按「未知」容错处理"; exit 1; }
+          grep -q '保护状态探测失败' .ci/git-sync.yml \
+            || { echo "❌ 保护状态探测失败时没有明确日志，会变成静默行为差异"; exit 1; }
+          grep -q '未能从 post-pull 输出里解析出 PR 编号' .ci/git-sync.yml \
+            || { echo "❌ PR 编号解析失败时不再显式报错，会退化成「PR 开着没人合」"; exit 1; }
+          grep -q 'echo "$post_out"' .ci/git-sync.yml \
+            || { echo "❌ post-pull 的原始输出没有打出来，解析失败时无从排查"; exit 1; }
+          # ---- 触发意图约定（参考上游项目 intent-selftest 核心）----
+          grep -q '只给一个地址、什么都不说，也算有效指令' .cnb/settings.yml \
+            || { echo "❌ 角色提示词没写「只有地址也算指令」，同步官会反问用户"; exit 1; }
+          grep -q '不要反问' .cnb/settings.yml \
+            || { echo "❌ 角色提示词没禁止对裸地址反问"; exit 1; }
+          grep -q '只给出一个参考上游项目地址' skills/sync-upstream/SKILL.md \
+            || { echo "❌ SKILL.md 未把「孤零零一个参考项目地址」列为触发信号"; exit 1; }
+          grep -q '不要反问用户想干什么' skills/sync-upstream/SKILL.md \
+            || { echo "❌ SKILL.md 未禁止把裸地址当歧义去追问"; exit 1; }
+          grep -q '无人值守' skills/sync-upstream/SKILL.md \
+            || { echo "❌ SKILL.md 没讲无人值守/自动合并"; exit 1; }
+          grep -q 'git:auto-merge' skills/sync-upstream/SKILL.md \
+            || { echo "❌ SKILL.md 没解释兜底用的 git:auto-merge"; exit 1; }
+          grep -q 'merge-pull' skills/sync-upstream/SKILL.md \
+            || { echo "❌ SKILL.md 没讲内联 merge-pull 这条主收口"; exit 1; }
+          grep -q 'repo-manage:rw' skills/sync-upstream/SKILL.md \
+            || { echo "❌ SKILL.md 没记录「NPC token 无 repo-manage:rw」这条硬约束"; exit 1; }
+          grep -q 'git:auto-merge' .cnb/settings.yml \
+            || { echo "❌ 角色提示词没交代兜底用的 git:auto-merge"; exit 1; }
+          grep -q 'merge-pull' .cnb/settings.yml \
+            || { echo "❌ 角色提示词没交代「内联直接合并」这条收口"; exit 1; }
+          grep -q '最小文件落地' .cnb/settings.yml \
+            || { echo "❌ 角色提示词没交代「最小文件落地」"; exit 1; }
+          echo "✅ 频率与资源约定自检通过"
+
+      - name: lfs-selftest
+        # 同步脚本全场景回归（含 LFS 专项）：覆盖平铺/子目录/增量/冲突/no-update 等
+        script: |
+          set -euo pipefail
+          if command -v git-lfs >/dev/null 2>&1; then
+            bash skills/sync-upstream/scripts/tests/run-tests.sh | tail -1
+          else
+            echo "⚠️ 镜像缺 git-lfs，跳过场景回归（生产镜像需带 git-lfs）"
+          fi
+
+      - name: bootstrap-skills-selftest
+        # 在隔离 HOME 里分别验证三条路径：
+        #   ① 本仓工作区直接执行（watchdog 自身场景）
+        #   ② 跨仓自举：工作区没有本仓文件时，能克隆本仓再装技能（NPC 事件真实场景）
+        #   ③ hash 门禁：锁文件 hash 被篡改时，官方技能必须被拒装（真锁版本）
+        script: |
+          set -euo pipefail
+          export HOME="$(mktemp -d)"
+          bash .cnb/bootstrap-skills.sh
+          [ -f "$HOME/.codebuddy/skills/sync-upstream/SKILL.md" ] || { echo "❌ sync-upstream 未加载"; exit 1; }
+          SKILLS_LIST="$(ls "$HOME/.codebuddy/skills" 2>/dev/null || true)"
+          if grep -q '^cnb-api$' <<< "${SKILLS_LIST}" && command -v jq >/dev/null 2>&1 \
+             && git ls-remote https://cnb.cool/cnb/skills/cnb-skill.git >/dev/null 2>&1; then
+            # 参考项目可达时：锁文件 hash 与参考上游项目一致才能装上 cnb-api，证明 hash 校验在跑且锁文件不过期
+            [ -d "$HOME/.codebuddy/skills/cnb-api" ] || { echo "❌ 参考项目可达但 cnb-api 未装（锁 hash 与参考上游项目不符？）"; exit 1; }
+            echo "✅ 官方技能 hash 校验通过（cnb-api 已按锁版本安装）"
+          else
+            echo "⚠️ 参考项目不可达或缺 jq，跳过 hash 安装断言（离线环境走本仓副本兜底）"
+          fi
+          echo "✅ 技能加载自检通过"
+          # 跨仓自举路径：在空目录里跑，验证能匿名克隆本仓取回技能
+          export HOME="$(mktemp -d)"
+          workdir="$(mktemp -d)"
+          cp .cnb/bootstrap-skills.sh "${workdir}/bootstrap-skills.sh"
+          ( cd "${workdir}" && bash bootstrap-skills.sh )
+          [ -f "$HOME/.codebuddy/skills/sync-upstream/SKILL.md" ] || { echo "❌ 跨仓自举失败：sync-upstream 未加载"; exit 1; }
+          echo "✅ 跨仓自举自检通过"
+          # hash 门禁负向用例：篡改锁文件 hash，官方技能必须被拒装
+          if command -v jq >/dev/null 2>&1 \
+             && git ls-remote https://cnb.cool/cnb/skills/cnb-skill.git >/dev/null 2>&1; then
+            export HOME="$(mktemp -d)"
+            workdir2="$(mktemp -d)"
+            mkdir -p "${workdir2}/.cnb" "${workdir2}/skills/sync-upstream"
+            cp .cnb/bootstrap-skills.sh "${workdir2}/.cnb/"
+            cp skills/sync-upstream/SKILL.md "${workdir2}/skills/sync-upstream/"
+            jq '(.skills["cnb-api"].computedHash) = "0000000000000000000000000000000000000000000000000000000000000000"' \
+              skills-lock.json > "${workdir2}/skills-lock.json"
+            # 副本目录模拟「工作区即本仓」场景：skills/ 存在 → bootstrap 直接读本仓，
+            # 但锁文件已篡改 → cnb-api 必须被 hash 门禁拒装
+            ( cd "${workdir2}" && bash .cnb/bootstrap-skills.sh ) > "${workdir2}/out.log" 2>&1 || true
+            if [ -d "${HOME}/.codebuddy/skills/cnb-api" ]; then
+              echo "❌ hash 不符仍被安装：computedHash 门禁未生效"; cat "${workdir2}/out.log"; exit 1
+            fi
+            grep -q "hash 不符" "${workdir2}/out.log" \
+              || { echo "❌ hash 拒装未输出告警"; cat "${workdir2}/out.log"; exit 1; }
+            echo "✅ hash 门禁负向用例通过（篡改 hash 被拒装并告警）"
+          else
+            echo "⚠️ 离线环境，跳过 hash 门禁负向用例"
+          fi
+
+
+main:
+  "crontab: 23 4 * * *":
+    - name: skill-selftest
+      # 自检很轻，1 核够用
+      runner:
+        cpus: 1
+      docker:
+        image: cnbcool/default-build-env
+      stages: !reference [.skill-selftest, selftest_stages]
+    - name: skills-lock-watch
+      # 官方技能锁检测与自动跟进（仅每日自检，不进 PR CI），与 skill-selftest
+      # 并行跑。detect 与 auto-update 必须同管线串行：后者的 if 依赖前者的 exports。
+      runner:
+        cpus: 1
+      stages:
+      - name: detect-skills-lock-staleness
+        # 官方技能锁文件过期检测（PR #14 评审遗留）：
+        # bootstrap 按 computedHash 真锁版本（hash 不符拒装），官方技能仓 cnb/skills
+        # 静默更新后本仓锁文件会过期——参考项目可达但技能装不上。每日检测，过期即告警。
+        # 只报告不改动；自动刷锁在下一 stage（auto-update-skills-lock）。
+        runner:
+          cpus: 1
+        script: |
+          set -euo pipefail
+          bash .ci/refresh-skills-lock.sh
+        exports:
+          SKILLS_LOCK_STATUS: SKILLS_LOCK_STATUS
+          SKILLS_UPSTREAM_SHA: SKILLS_UPSTREAM_SHA
+          SKILLS_STALE_COUNT: SKILLS_STALE_COUNT
+          SKILLS_STALE_LIST: SKILLS_STALE_LIST
+          SKILLS_MISSING_LIST: SKILLS_MISSING_LIST
+      - name: auto-update-skills-lock
+        # 锁文件过期 → 自动重算 hash 刷锁，经分支 skills/auto-update 开 PR，
+        # 人工评审合并后生效（up-to-date 零噪音；跳过 fetch-failed 与已有 open PR 的情况）。
+        # 自动跟进不引入新的参考上游项目信任：刷新后的锁文件仍须走 bootstrap 的 hash 校验，
+        # PR 合并是人工评审——自动跟进只省「重算 hash」的体力活，
+        # 「参考项目内容进本仓」这道门仍由人把守。
+        # 想改回「只告警不刷」：把下一行改成 SKILLS_AUTO_UPDATE=0。
+        if: '[ "$SKILLS_LOCK_STATUS" = "stale" ] && [ "${SKILLS_AUTO_UPDATE:-1}" = "1" ]'
+        runner:
+          cpus: 1
+        script: |
+          set -euo pipefail
+          SKILLS_BRANCH="skills/auto-update"
+          # 已有同分支 open PR 时复用（自动重置分支会带入），不重复建
+          existing_pr="$(cnb pulls list-pulls --repo "${CNB_REPO_SLUG}" --state open -v 2>/dev/null \
+            | jq -r --arg b "refs/heads/${SKILLS_BRANCH}" \
+              '.data[]? | select(.head.ref == $b) | .number' | head -1 || true)"
+          git config user.name  "cnb-sync-bot"
+          git config user.email "cnb-sync-bot@users.noreply.cnb.cool"
+          git switch -c "${SKILLS_BRANCH}" 2>/dev/null || git switch "${SKILLS_BRANCH}"
+          git reset --hard origin/"${CNB_BRANCH}"
+          SKILLS_REFRESH_SUMMARY_FILE="$(mktemp)" \
+            bash .ci/refresh-skills-lock.sh --refresh
+          title="chore: 官方技能仓库更新，刷新 skills-lock.json（官方技能仓库 ${SKILLS_UPSTREAM_SHA:0:8}）"
+          # PR 正文用 printf 拼接：原 heredoc 的 DESC 结束符带 yaml 缩进，平台 sh -c 识别不到
+          # （吞掉后半段脚本致 exit 2——auto-update 链首次触发即断，构建 cnb-hkh-1k3ndbf9v 实录）
+          body="$(printf '%s\n' \
+            '## 官方技能仓库自动跟进' \
+            '' \
+            "${CNB_REPO_SLUG} 使用的官方技能仓库 **cnb/skills/cnb-skill** main 已更新（${SKILLS_UPSTREAM_SHA:0:8}），本仓 \`skills-lock.json\` 的 \`computedHash\` 落后 ${SKILLS_STALE_COUNT} 个技能：**${SKILLS_STALE_LIST}**。" \
+            '' \
+            '本 PR 由每日自检流水线（`.ci/watchdog.yml` → `auto-update-skills-lock`）自动创建：重算了落后技能的 hash 并写回锁文件（其余字段零改动）。' \
+            '' \
+            '### 逐技能变更（锁值 → 官方技能仓库当前值）' \
+            '' \
+            '```' \
+            "$(cat "${SKILLS_REFRESH_SUMMARY_FILE:-/dev/null}")" \
+            '```' \
+            '' \
+            '### 合并须知' \
+            '' \
+            '- **人工评审参考项目内容后再合并**——自动跟进只省「重算 hash」的体力活，「官方技能内容进本仓」这道门仍由人把守；不认可参考项目改动就关掉本 PR，bootstrap 会继续按锁文件拒装新版本' \
+            '- 合并后 NPC 镜像不重建（只有 main push 才重建），技能以锁文件为准即时生效' \
+            '- 官方技能仓库已删除的技能条目不自动移除（如有，见 SKILLS_MISSING_LIST 告警），需要时人工清理' \
+            '- 审查办法：对照官方技能仓 cnb/skills `skills/<name>/` 的实际 diff 逐技能过目' \
+          )"
+          if git diff --quiet; then
+            echo "⏭️ 刷锁后无实际变更（官方技能仓库可能中途回滚），跳过"
+            exit 0
+          fi
+          git add skills-lock.json
+          git commit -m "${title}"
+          git push origin "HEAD:${SKILLS_BRANCH}" --force-with-lease
+          if [ -n "${existing_pr:-}" ]; then
+            echo "ℹ️ 已有 open PR #${existing_pr}（分支 ${SKILLS_BRANCH}），本次为重置分支更新，不重复建 PR"
+          else
+            cnb pulls post-pull \
+              --repo "${CNB_REPO_SLUG}" \
+              --base "${CNB_BRANCH}" \
+              --head "${SKILLS_BRANCH}" \
+              --title "${title}" \
+              --body "${body}"
+          fi
+        failStages:
+          - name: report
+            script: |
+              echo "⚠️ 官方技能锁文件过期（stale）但自动跟进失败，请人工重算 hash 刷新 skills-lock.json"
+              echo "   详见 stage auto-update-skills-lock 日志；脚本：bash .ci/refresh-skills-lock.sh --refresh"

@@ -14,9 +14,8 @@ include:
 #     hy4-preview → thinking high；deepseek-v4.1-flash → thinking off；其余 medium。
 #     deepseek-v4.1-flash / glm-5.3-flash → supportImage true。
 #
-# 密钥注入：本公开导出快照已**剥离全部 imports 密钥引用**。
-#   原 CNB 仓在 npc 事件流水线用 imports 注入 CNB_MIRROR_TOKEN / GH_TOKEN（跨根组织推仓凭证）；
-#   此处不再引用任何密钥仓库，故该注入能力在导出件中不存在。
+# 凭证注入：本公开导出快照已**剥离全部密钥引用**，不含任何凭证注入配置。
+#   需要私有仓拉取凭证的场景，由使用者自行在运行环境侧以环境变量注入（见 README）。
 
 # PR CI：目标分支为 main 的 PR（创建/重开/源分支 push）跑 watchdog 全量自检。
 # 注意：PR 事件的分支 key 匹配的是 PR **目标分支**（quick-start 口径：main: pull_request
@@ -136,10 +135,8 @@ kimi-k3: *model_role
 # 没有本仓的 skills/，bootstrap-skills.sh 会先克隆本仓再装技能），然后 npc:go。
 # npc:go 不指定 model：同步任务与模型无关，走平台默认模型。
 同步官:
-  # 密钥注入（owner 决策 2026-09-23，Issue #13）：直接 imports 现有密钥仓库文件，
-  # 与既有对齐类角色同款。同步官因此不可分享（不进 NPC 榜单）——本仓保持公开，
-  # 外部用户仍可按完整路径 @xgzwlkj/npc(同步官) 触发，服务不受影响。
-  # 注入的 CNB_MIRROR_TOKEN / GH_TOKEN 可作为私有参考项目拉取凭证（CNB / GitHub 参考上游项目）。
+  # 本公开快照不含任何凭证注入配置：私有参考项目拉取凭证由运行环境侧
+  # 以环境变量注入（脚本自动收编为 UPSTREAM_TOKEN），公开参考项目零配置可用。
   issue.comment@npc:
       docker:
         image: ${CNB_DOCKER_REGISTRY}/${CNB_NPC_SLUG_LOWERCASE}:latest

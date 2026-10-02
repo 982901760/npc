@@ -304,14 +304,13 @@ grep -q '^<BRANCH>:' .cnb/git-sync.yml \
 
 私有参考项目的拉取凭证**来自运行环境注入的环境变量**（单一通道，零模板改造）：
 
-- 同步官的运行环境已由本仓事件流水线 `imports` 密钥仓库注入
-  `CNB_MIRROR_TOKEN`（CNB 参考上游项目）/ `GH_TOKEN`（GitHub 参考上游项目）。
-  同步脚本自动收编二者作为 `UPSTREAM_TOKEN`（显式 `UPSTREAM_TOKEN` 优先），
+- 同步官的运行环境可由环境变量注入拉取凭证（`CNB_MIRROR_TOKEN` / `GH_TOKEN` / 显式 `UPSTREAM_TOKEN`）。
+  同步脚本自动收编为 `UPSTREAM_TOKEN`（显式 `UPSTREAM_TOKEN` 优先），
   临时改写拉取 URL、fetch 完立即还原——令牌不落代码、不进日志。
 - 目标仓库的定时任务默认**不含任何令牌**（模板零密钥引用）。
   若目标仓库的流水线也需要拉私有参考项目，由引用方自行在 `.cnb/git-sync.yml`
   的 `env` 段注入 `UPSTREAM_TOKEN`（模板 env 段已留注释占位行）——
-  来源不限（如密钥仓库 `imports`），写法由引用方决定，本技能不做约定。
+  来源不限，写法由引用方决定，本技能不做约定。
 
 带令牌探测/拉取的 URL 写法（与脚本内置一致，仅临时使用）：
 

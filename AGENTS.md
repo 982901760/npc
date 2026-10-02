@@ -60,8 +60,9 @@
   合并后 `pull_request.merged` 流水线自动删源分支）、LFS 自动探测与真身还原（拉不到就中止、不提交指针文件）、
   `Upstream-Sync` 增量游标、只读参考上游项目、改动走 PR。
 - **令牌单通道**（owner 决策 2026-09-23 Issue #13 引入双通道，2026-09-24 Issue #13 收敛为单通道）：同步官事件流水线直接
-  imports 本仓密钥仓库 `dev-signing-secrets.yml`，注入的 `CNB_MIRROR_TOKEN`/`GH_TOKEN` 由同步脚本收编为
+  由运行环境以环境变量注入的 `CNB_MIRROR_TOKEN`/`GH_TOKEN` 由同步脚本收编为
   `UPSTREAM_TOKEN`（显式变量优先），fetch 前临时改写 URL、fetch 后（含失败分支）立即还原，令牌不落代码不进日志。
+  本公开快照已剥离全部凭证注入配置（不含任何私有仓引用）。
   目标仓库定时任务默认零密钥引用；若需拉私有参考项目由引用方自行在模板 env 段注入 `UPSTREAM_TOKEN`（模板已留注释占位行）。
   同步官因此**不可分享**（不进 NPC 榜单，本仓保持公开、完整路径 @ 仍可触发）。
 - **与对齐类角色的区别**：对齐管家管四仓镜像拓扑对齐；同步官管「任意参考上游项目（公开/私有带令牌） → 任意仓库」的搬运与定时跟进，二者独立。
@@ -125,7 +126,7 @@
 
 1. **活跃仓活口径**：`$CNB_REPO_SLUG`（云端会话权威）→ `git config cnb.activerepo`（本地声明，L-150）→ `git ls-remote <四仓> refs/heads/main` 比对近 7 日落点 + Issue/PR/流水线活动侧证。**禁止**凭文档快照或历史记忆声称活跃仓（轮换以周计，静态快照 5 天内过期有实证）。
 2. **拓扑成员**：CNB 四仓 `xgzwl/website`、`xgz/website/xgzwl-network`、`xgzwlkj/web`、`hfxgzwl/website` 互为对等轮换镜像；GitHub `xgzwl/xgzwl-network` 为 directPush 直推白名单（免费版私有仓无分支保护）。**身份判定禁用裸子串**（`hfxgzwl/website` 包含子串 `xgzwl/website` 已实际踩坑——活跃仓解析须段边界匹配 + 运行时声明权威）。
-3. **密钥可达性**：先实跑 `git ls-remote` 四仓 + GitHub。密钥不可达（PAT 未补 / allow_slugs 未覆盖 / gh 未登录）→ 明确报告缺口，指引 owner Web 端补录，**不臆测不硬闯**。密钥仓 `allow_events`「声明即收紧」——新增事件须同笔补白名单。
+3. **凭证可达性**：先实跑 `git ls-remote` 四仓 + GitHub。凭证不可达（PAT 未补 / 授权范围未覆盖 / gh 未登录）→ 明确报告缺口，指引 owner 在运行环境侧补录，**不臆测不硬闯**。
 4. **环境前提**：GPG 签名链须 `GNUPGHOME` 环境变量显式注入子进程链（CNB 服务端 pre-receive 强制签名，无签提交必拒；签名探测走 `gpg.program` 原生路径）；客户端 hooks 防线已随 `pnpm install` 的 `prepare` 生命周期强制启用（任何环境装依赖即生效，无需手工 setup）。
 
 ### 二、对齐序列（发版与 tag 同步）
@@ -164,7 +165,7 @@
 
 ### 红线（对齐任务适用）
 
-- 令牌、凭证一律脱敏，不落代码、不进日志；密钥文件仅 owner 在密钥仓 Web 端编辑。
+- 令牌、凭证一律脱敏，不落代码、不进日志；凭证仅 owner 在运行环境侧注入，绝不写入本仓任何文件。
 - CNB 三镜像 main 受平台保护**禁直推**（服务端 hook 拒绝），一律 PR 通道；GitHub 直推仅限 directPush 白名单。
 - 不 `--force` 覆盖双向实质独有内容（diverged 阻断的意义所在）；孤儿 tag 禁删除（覆盖推真身）。
 - 禁用 squash 合并对齐 PR（破坏 R3 父链，见 §14）。

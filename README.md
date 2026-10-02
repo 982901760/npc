@@ -12,7 +12,7 @@
 | --- | --- |
 | **对齐管家**（默认） | 四仓镜像对齐与 tag 同步的执行管家，默认绑定**最新模型** `deepseek-v4.1-flash` |
 | **hy4-preview / deepseek-v4.1-flash / glm-5.3 / glm-5.3-flash / glm-5.2 / kimi-k3** | A/B 实测角色，角色名即模型 ID，触发时动态绑定对应模型跑同一对齐任务 |
-| **同步官** | 参考上游项目引入 NPC（参考上游项目 <https://cnb.cool/i.o/sync>，全功能保留 + 私有参考项目令牌单通道）：在任意仓库 @ 即可把参考上游项目（公开开箱即用、私有走环境注入令牌）同步进来并配置定时自动更新 + PR 自动合并（无人值守）；因 imports 密钥不可分享，需完整路径 @ |
+| **同步官** | 参考上游项目引入 NPC（参考上游项目 <https://cnb.cool/i.o/sync>，全功能保留 + 私有参考项目令牌单通道）：在任意仓库 @ 即可把参考上游项目（公开开箱即用、私有走环境注入令牌）同步进来并配置定时自动更新 + PR 自动合并（无人值守）；因涉及私有凭证，公开快照仅作参考实现，需完整路径 @ |
 
 > 角色人设见 [`.cnb/settings.yml`](.cnb/settings.yml)，角色名需与 [`.cnb.yml`](.cnb.yml) 顶层事件绑定 key 完全一致。
 > 模型清单与思考级别/图片支持口径对齐自参考上游项目 <https://cnb.cool/npc/CodeBuddy>（对齐 `180dd6b`，2026-09-11）。
@@ -41,7 +41,7 @@
 | 内置自测（`--selftest`） | ✅ | ✅ | 执行前链路自检（align-mirror 53 例 / merge-pull-verified 17 例） |
 | 多模型 A/B 实测 | — | ✅ | @ 不同模型角色跑同一任务对比结果 |
 | 模型 | deepseek-v4.1-flash（thinking off） | 角色名对应模型 | 见 [`.cnb.yml`](.cnb.yml) 动态绑定 |
-| 密钥注入（imports） | ✅ | ✅ | `CNB_MIRROR_TOKEN` / `GH_TOKEN` 由密钥仓注入 |
+| 凭证注入 | 无（公开参考项目限定） | 由运行环境以环境变量注入（本公开快照不含任何凭证配置） |
 
 > A/B 实测角色共享同一套 `*align_prompt` 人设，仅模型不同，便于横向对比输出质量与对齐效果。
 
@@ -68,8 +68,8 @@
 - **增量同步**：`Upstream-Sync` 标记游标 + merge-base 判定；参考上游项目强推历史可继续；重叠改动列文件不静默
 - **只读参考上游项目**：upstream push 地址置 `no-push://disabled`，绝不推回参考上游项目
 - **改动走 PR**：分支 `sync/bootstrap` + PR，不直推默认分支
-- **私有参考项目（可选令牌通道，单一来源）**：同步官运行环境已由本仓事件流水线 `imports` 密钥仓库注入
-  `CNB_MIRROR_TOKEN`（CNB 参考上游项目）/ `GH_TOKEN`（GitHub 参考上游项目），同步脚本自动收编为拉取凭证
+- **私有参考项目（可选令牌通道，单一来源）**：同步官运行环境可由环境变量注入拉取凭证
+  （`CNB_MIRROR_TOKEN` / `GH_TOKEN`），同步脚本自动收编为 `UPSTREAM_TOKEN` 拉取凭证
   （临时改写 URL、fetch 完立即还原，含失败分支），令牌不落代码不进日志——**多数私有参考项目零配置**。
   目标仓库的定时任务默认零密钥引用；若它也要拉私有参考项目，由引用方自行在 `.cnb/git-sync.yml`
   的 env 段注入 `UPSTREAM_TOKEN`（模板已留注释占位行），来源与写法由引用方决定
@@ -80,7 +80,7 @@
 | --- | --- | --- |
 | 技能装载 | 工作区即本仓，`cnbcool/default-npc:latest` 直接 `npc:go` | NPC 事件工作区是**目标仓库**，`bootstrap-skills.sh` 先匿名浅克隆本仓（`CNB_NPC_SHA` 锁版本）再装技能，然后 `npc:go` |
 | 脚本/模板取源 | `i.o/sync` | 本仓 slug 硬编码为 `xgzwlkj/npc`（注入的 `CNB_NPC_SLUG` 可能指向参考上游项目 CodeBuddy 仓——那里没有 skills/；仅在注入 slug 克隆结果带技能时采信） |
-| 私有参考项目令牌 | 不支持（公开参考项目限定） | 环境令牌单通道：本仓事件流水线 imports 密钥仓注入的 `CNB_MIRROR_TOKEN`/`GH_TOKEN` 收编为 `UPSTREAM_TOKEN` |
+| 私有参考项目令牌 | 不支持（公开参考项目限定） | 环境令牌单通道：运行环境注入的 `CNB_MIRROR_TOKEN`/`GH_TOKEN` 收编为 `UPSTREAM_TOKEN` |
 | 运行镜像 | `cnbcool/default-npc:latest` | 复用本仓自建镜像（预装 cnb cli / git / git-lfs / gpg / gh） |
 | 每日自检 | `.ci/watchdog.yml`（04:23） | 同款自检（04:23）+ 同步官角色/事件绑定校验 + 跨仓自举路径自检 + 锁文件过期检测与自动跟进 |
 | PR CI | 无 | 目标分支为 main 的 PR 跑同款自检四 stage（`!reference` 复用，防两处漂移） |
@@ -90,16 +90,16 @@
 
 公开参考项目零配置可用。私有参考项目的拉取凭证来自**运行环境注入的环境变量**（单一通道）：
 
-- 同步官执行同步时：环境已注入 `CNB_MIRROR_TOKEN` / `GH_TOKEN`（本仓事件流水线 `imports`
-  密钥仓库 `<密钥文件>`），脚本自动收编——**零配置**，令牌只在 fetch 时
+- 同步官执行同步时：环境可由 owner 注入 `CNB_MIRROR_TOKEN` / `GH_TOKEN`，
+  脚本自动收编——**零配置**，令牌只在 fetch 时
   临时改写 URL、fetch 完（含失败分支）立即还原，提交信息/本地引用/日志永远不带凭证
 - 目标仓库的定时任务默认**不含任何令牌**（模板零密钥引用）。若定时任务也需要拉私有参考项目，
   由引用方自行在 `.cnb/git-sync.yml` 的 `env` 段注入 `UPSTREAM_TOKEN`（模板 env 段已留
-  注释占位行）——来源不限（如密钥仓库 `imports`），写法由引用方决定
+  注释占位行）——来源不限，写法由引用方决定
 - 环境无令牌时按私有仓库无权限处理：同步官评论给出指引，不硬闯、不输出任何凭证
 
-> 该 NPC 因 imports 密钥仓库文件**不可分享**（不进 NPC 榜单）；本仓保持公开可读，
-> 外部用户仍可按完整路径 `@xgzwlkj/npc(同步官)` 触发，服务不受影响。
+> 本快照为**公开导出件**：已剥离全部凭证注入配置，不含任何私有仓引用；
+> 完整服务仍可按完整路径 `@xgzwlkj/npc(同步官)` 触发。
 
 ### 无人值守与默认分支（跟进参考上游项目 49658d0 → 816a4cc）
 
@@ -177,7 +177,7 @@ bash .ci/refresh-skills-lock.sh                        # 锁文件过期检测�
 - **四仓拓扑**：`xgzwl/website`、`xgz/website/xgzwl-network`、`xgzwlkj/web`、`hfxgzwl/website`（CNB 四仓）+ GitHub 私有镜像 `github.com/xgzwl/xgzwl-network`。AI 积分轮换制，任一仓随时可成活跃开发仓。
 - **执行链路**：以实跑判定的活跃仓为基线，走 `pnpm align:mirror` 全自动链路（selftest → 干跑判需 → 逐镜像构造签名快进提交 → 推对齐分支 → 建 PR → 轮询 CI → 合并 → 回读落地真值）；tag 同步随链路推送。
 - **镜像口径**：仓库级（分支 + tag）树级对齐——镜像 main 的**树**与活跃仓逐字一致即达成（分发形态合法，不要求历史同构）；CNB 三镜像 main 受平台保护禁直推一律 PR 通道，GitHub 走直推白名单。
-- **密钥通道**：跨根组织通过 `imports` 注入密钥仓库 `<私有密钥仓>` 的 `CNB_MIRROR_TOKEN` / `GH_TOKEN`（见 `.cnb.yml`）。
+- **凭证通道**：跨组织访问私有仓由 owner 在运行环境侧以环境变量注入令牌（`CNB_MIRROR_TOKEN` / `GH_TOKEN`）；本公开快照不含任何凭证配置。
 
 ## 合并策略（2026-09-12 终版口径）
 
@@ -205,7 +205,7 @@ AGENTS.md           面向 AI Agent 的仓库约定与四仓对齐纪律（2026-
 
 - 新增角色：在 `.cnb/settings.yml` 的 `roles:` 末尾追加角色（含 `name`/`slogan`/`prompt`），并在 `.cnb.yml` 顶层补同名事件绑定（角色名 = 模型 ID 时用 `${CNB_NPC_NAME}` 动态绑定）。
 - 模型清单对齐参考上游项目 `npc/CodeBuddy`：新增/下线模型时同步 `settings.yml` 的 `roles` 与 `.cnb.yml` 顶层 key，两者必须逐字一致，否则 @ 角色无法触发。
-- 密钥缺口（PAT 未补录 / allow_slugs 未覆盖 / gh 未登录）一律由 owner 到密钥仓库 Web 端补录，禁止本地克隆或落代码。
+- 凭证缺口（PAT 未补录 / 授权范围未覆盖 / gh 未登录）一律由 owner 在运行环境侧补录，禁止落代码或进日志。
 - 变更仓库操作约定时，同步刷新 `AGENTS.md`，避免活跃仓轮换后文档快照过期；四仓对齐纪律节随活跃仓对齐链路演进同步更新（当前基于 xgzwl/website main `116a5a3` 证据链）。
 
 ## 安全

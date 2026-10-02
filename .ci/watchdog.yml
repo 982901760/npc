@@ -139,12 +139,11 @@
             || { echo "❌ refresh-skills-lock.sh 丢了 SKILLS_LOCK_STATUS 输出（stale/up-to-date 判据失效）"; exit 1; }
           grep -q 'SKILLS_AUTO_UPDATE' .ci/watchdog.yml \
             || { echo "❌ watchdog.yml 丢了 SKILLS_AUTO_UPDATE 自动跟进开关（锁过期只剩人工兜底）"; exit 1; }
-          # 同步官事件流水线须保留密钥 imports（owner 决策 2026-09-23，Issue #13：
-          # 注入 CNB_MIRROR_TOKEN/GH_TOKEN 兼作私有参考项目拉取凭证）——两个事件都要有，防回退
-          CNB_YML_SYNC="$(awk '/^同步官:/,0' .cnb.yml || true)"
-          n_imports="$(grep -c 'dev-signing-secrets.yml' <<< "${CNB_YML_SYNC}")"
-          [ "${n_imports}" -ge 2 ] \
-            || { echo "❌ .cnb.yml 同步官事件缺密钥 imports（期望 issue+PR 两事件各 1 处，实际 ${n_imports}）"; exit 1; }
+          # 公开导出快照：全仓不得含任何凭证注入 / 私有密钥仓引用，防回退
+          n_secret="$(grep -rE 'imports:|dev-signing-secrets|website-secrets|私有密钥仓' \
+            --include='*.yml' --include='*.md' --include='*.sh' . 2>/dev/null | wc -l)"
+          [ "${n_secret}" -eq 0 ] \
+            || { echo "❌ 公开快照残留凭证注入引用（期望 0 处，实际 ${n_secret}）"; exit 1; }
           # ---- 省 token 约定（参考上游项目 i.o/sync cost-selftest 同款）----
           grep -q 'SEED_SOURCE' skills/sync-upstream/scripts/sync-upstream.sh \
             || { echo "❌ sync-upstream.sh 丢了 SEED_SOURCE 铺源路径"; exit 1; }

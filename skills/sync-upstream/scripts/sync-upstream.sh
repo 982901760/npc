@@ -23,8 +23,8 @@
 #     一律**中止本次同步并报 conflict**，绝不提交指针文件冒充成功 ——
 #     指针入库等于内容丢失，且下次同步会误判为「已同步」而永不重试。
 #
-# 私有参考项目支持（可选）：令牌来自运行环境注入（本仓同步官事件流水线已 imports
-# 密钥仓库，注入 CNB_MIRROR_TOKEN / GH_TOKEN），经 UPSTREAM_TOKEN 环境变量传入。
+# 私有参考项目支持（可选）：令牌来自运行环境注入（CNB_MIRROR_TOKEN / GH_TOKEN /
+# 显式 UPSTREAM_TOKEN），经 UPSTREAM_TOKEN 环境变量传入。
 # 令牌只在 fetch 前临时改写 upstream URL、fetch 完立即还原，绝不落代码/日志。
 # 无令牌时回落匿名拉取（公开参考项目行为不变）。
 #
@@ -47,8 +47,8 @@ TARGET_DIR="${TARGET_DIR%/}"
 BOT_NAME="${SYNC_BOT_NAME:-cnb-sync-bot}"
 BOT_EMAIL="${SYNC_BOT_EMAIL:-cnb-sync-bot@users.noreply.cnb.cool}"
 # 私有参考项目令牌（可选）：优先显式 UPSTREAM_TOKEN；否则收编运行环境已注入的
-# CNB_MIRROR_TOKEN（CNB 参考上游项目）/ GH_TOKEN（GitHub 参考上游项目）——同步官事件流水线
-# 经密钥仓库 imports 注入，目标仓库零配置即可同步私有参考项目。
+# CNB_MIRROR_TOKEN（CNB 参考上游项目）/ GH_TOKEN（GitHub 参考上游项目）——
+# 目标仓库零配置即可同步私有参考项目。
 UPSTREAM_TOKEN="${UPSTREAM_TOKEN:-${CNB_MIRROR_TOKEN:-${GH_TOKEN:-}}}"
 AUTH_FETCH_URL="${UPSTREAM_REPO}"
 if [ -n "${UPSTREAM_TOKEN}" ]; then
